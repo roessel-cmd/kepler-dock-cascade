@@ -14,15 +14,15 @@
 ![Containers](https://img.shields.io/badge/containers-Apptainer-1D4ED8)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)
 
-**A three-stage, multi-GPU pipeline for high-throughput structure-based virtual screening.**
+Multi-GPU pipeline for structure-based virtual screening.
 
-Ligand preparation, GPU docking, and consensus rescoring run as three independent
-containers, each with its own configuration and its own entry point. Stages can be
-run individually or chained, and the docking stage resumes from where it stopped
-after a crash or a wall-clock limit.
+Ligand preparation, docking and consensus rescoring run as three separate
+Apptainer containers, each with its own configuration and entry point. Stages
+can be run individually or in sequence. The docking stage resumes from where it
+stopped after a crash or a wall-clock limit.
 
-Built around [Uni-Dock](https://github.com/dptech-corp/Uni-Dock) for docking and
-[gnina](https://github.com/gnina/gnina) for CNN-based rescoring.
+Docking uses [Uni-Dock](https://github.com/dptech-corp/Uni-Dock), rescoring uses
+[gnina](https://github.com/gnina/gnina).
 
 ---
 
@@ -41,33 +41,31 @@ and the rescoring container has no ligand-preparation tooling.
 
 ## Design notes
 
-**Direct SDF → PDBQT conversion.** Going through PDB discards explicit bond
-orders; downstream tools then reconstruct connectivity geometrically, which
-misassigns bonds for unfavourable conformers. RDKit reads bond orders from the
-SDF and Meeko writes PDBQT natively, so the information is never lost.
+**Direct SDF to PDBQT conversion.** PDB has no bond records, so the common
+SDF → PDB → PDBQT route loses bond orders and the receiving tool reconstructs
+connectivity from interatomic distances. That misassigns bonds for unfavourable
+conformers. RDKit reads bond orders from the SDF, Meeko writes PDBQT without the
+PDB step.
 
-**Batched docking.** Ligands are submitted to Uni-Dock in batches rather than one
-process per ligand. Receptor parsing, grid-map construction, and GPU context
-setup are amortised across the batch instead of being repaid for every molecule.
-On out-of-memory the batch is halved and retried recursively, so a single
-oversized ligand does not cost the whole chunk.
+**Batched docking.** Ligands go to Uni-Dock in batches, not one process per
+ligand. Receptor parsing, grid-map construction and GPU context setup happen
+once per batch instead of once per molecule. On out-of-memory the batch is
+halved and retried, so one oversized ligand does not cost the whole chunk.
 
-**Work-stealing across GPUs.** Targets are assigned to GPUs, but a GPU that
-finishes its target early pulls chunks from other targets' queues instead of
-idling. Two chunk sizes are tuned independently: the orchestrator's dispatch
-unit and Uni-Dock's per-process batch.
+**Work-stealing across GPUs.** Targets are assigned to GPUs. A GPU that finishes
+its target early takes chunks from other targets' queues rather than idling.
 
-**Filesystem as state.** Completion is derived from the presence of
-`*_docked.pdbqt` files and `.done` markers, not from a database or an in-memory
-job table. A restart re-derives what is left to do by looking at the disk, which
-makes it robust to any kind of abrupt termination.
+**Filesystem as state.** Progress is derived from `*_docked.pdbqt` files and
+`.done` markers, not from a database or an in-memory job table. A restart
+recomputes the remaining work from what is on disk, so any form of abrupt
+termination is recoverable.
 
-**Robustness against container process hangs.** Apptainer containers have no
-PID 1 init to reap children. Under parallel workers, `SIGCHLD` can be lost and
-`os.system` blocks indefinitely in `wait()`. The MSMS and MGLTools call sites are
-patched to use `subprocess` with timeouts, `start_new_session`, and process-group
-kills, and the container build verifies via AST inspection that no `os.system`
-call survives.
+**Hang protection in the rescoring container.** Apptainer containers have no
+PID 1 init to reap children. With parallel workers, `SIGCHLD` can be lost and
+`os.system` then blocks in `wait()` indefinitely. The MSMS and MGLTools call
+sites use `subprocess` with timeouts, `start_new_session` and process-group
+kills instead. The container build checks by AST inspection that no `os.system`
+call remains.
 
 ---
 
@@ -110,17 +108,17 @@ cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py} .
 apptainer build ../rescoring-gpu.sif rescoring-gpu.def
 ```
 
-Verify that the Uni-Dock build supports your GPU architecture — this is the one
-check worth doing before anything else:
+Verify that the Uni-Dock build supports your GPU architecture before anything
+else:
 
 ```bash
 apptainer exec --nv unidock-gpu.sif bash -c \
   'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate docking_env && unidock --help'
 ```
 
-`no kernel image is available for execution on the device` means the packaged
-binary lacks your compute capability. Build Uni-Dock from source in `%post` with
-`CMAKE_CUDA_ARCHITECTURES` set accordingly.
+If this reports `no kernel image is available for execution on the device`, the
+packaged binary does not cover your compute capability. Build Uni-Dock from
+source in `%post` with `CMAKE_CUDA_ARCHITECTURES` set accordingly.
 
 ---
 
@@ -158,9 +156,9 @@ RUN_DOCKING=true
 RUN_RESCORING=true
 ```
 
-Re-ranking with different consensus weights costs one flag and no re-docking:
-set `RUN_CONVERSION=false`, `RUN_DOCKING=false`, adjust the `w_*` values in
-`config/rescore.ini`, and run again.
+Re-ranking with different consensus weights needs no re-docking: set
+`RUN_CONVERSION=false` and `RUN_DOCKING=false`, adjust the `w_*` values in
+`config/rescore.ini`, run again.
 
 To resume an interrupted docking run:
 
@@ -172,66 +170,294 @@ To resume an interrupted docking run:
 
 ## Configuration
 
-Two INI files, one per GPU stage. Stage 1 is configured through CLI arguments in
-`pipeline_start.sh`.
+Three configuration surfaces: the switches at the top of `pipeline_start.sh`,
+`config/docking.ini`, and `config/rescore.ini`. Stage 1 has no INI; it is
+configured through the `CONV_*` variables in the shell script.
 
-`config/docking.ini` — search effort, batch size, GPU count:
+Every option is listed below with its default. Options absent from an INI fall
+back to the value shown, except where marked required.
 
-```ini
-[UNIDOCK]
-search_mode = balance    # fast | balance | detail
-batch_size  = 1000       # ligands per Uni-Dock process
-scoring     = vina       # vina | vinardo | ad4
+### pipeline_start.sh
 
-[CHUNK]
-chunk_size  = 5000       # orchestrator dispatch unit
+| Variable | Default | Effect |
+|---|---|---|
+| `RUN_CONVERSION` | `true` | Run stage 1 |
+| `RUN_DOCKING` | `true` | Run stage 2 |
+| `RUN_RESCORING` | `true` | Run stage 3 |
+| `CHECK_CONFIG` | `true` | Run `check_config.py` before stage 1 |
+| `CHECK_LIGANDS` | `true` | Run `check_ligands.py` between stage 1 and 2 |
+| `CONTINUE_ON_ERROR` | `false` | Continue after a failed stage instead of aborting |
+| `CONV_SIF` | `sdf_to_pdbqt.sif` | Stage 1 container |
+| `CONV_LIB_DIR` | `LIB` | Directory scanned for `*.sdf` |
+| `CONV_OUT_DIR` | `data/PDBQT` | PDBQT output. Must match `[PATHS] pdbqt_dir` |
+| `CONV_WORKERS` | `15` | Parallel conversion processes |
+| `CONV_TIMEOUT` | `120` | Seconds per molecule before SIGALRM |
+| `CONV_UFF_ITERS` | `800` | UFF optimisation steps per molecule |
+| `CONV_FLAT` | `false` | `true` writes all PDBQTs into one directory |
+| `CONV_SUBDIR_PER_SDF` | `true` | One output subdirectory per input SDF |
+| `CONV_SKIP_IF_EXISTS` | `true` | Skip an SDF if its output directory already holds PDBQTs |
+| `DOCK_SIF` | `unidock-gpu.sif` | Stage 2 container |
+| `DOCK_INI` | `config/docking.ini` | Stage 2 configuration |
+| `DOCK_RESTART` | `false` | Use `restart_orchestrator.py`; also set by `--restart` |
+| `RESCORE_SIF` | `rescoring-gpu.sif` | Stage 3 container |
+| `RESCORE_INI` | `config/rescore.ini` | Stage 3 configuration |
+
+Command line: `--dry-run` prints every command without executing it, `--restart`
+sets `DOCK_RESTART=true`, `--help` prints the header.
+
+### config/docking.ini
+
+**`[PATHS]`.** All four are required. A missing key fails at startup with
+`KeyError`. Relative paths resolve against the project directory.
+
+| Key | Purpose |
+|---|---|
+| `pdbqt_dir` | Ligand PDBQTs from stage 1. Searched recursively |
+| `target_dir` | Receptor PDBQTs and `config.txt` |
+| `results_dir` | Poses and per-chunk CSVs. Handover to stage 3 |
+| `log_dir` | `pipeline.log`, chunk files, job directories |
+
+**`[GPU]`**
+
+| Key | Default | Effect |
+|---|---|---|
+| `num_gpus` | `1` | Number of GPUs used. The first N reported by `nvidia-smi` |
+| `cuda_device_id` | `0` | Which GPU to use when `num_gpus = 1`. Ignored otherwise |
+
+**`[UNIDOCK]`.** These map directly to Uni-Dock CLI flags.
+
+| Key | Default | Effect |
+|---|---|---|
+| `binary` | `unidock` | Path or command name of the Uni-Dock executable |
+| `search_mode` | `balance` | `fast`, `balance`, or `detail`. Empty string enables `exhaustiveness` and `max_step` |
+| `exhaustiveness` | `384` | Monte Carlo runs. Only read when `search_mode` is empty |
+| `max_step` | `0` | Steps per run. Only read when `search_mode` is empty; `0` omits the flag |
+| `num_modes` | `9` | Poses written per ligand |
+| `energy_range` | `3` | kcal/mol window below the best pose |
+| `scoring` | `vina` | `vina`, `vinardo`, or `ad4`. `ad4` requires precomputed AutoGrid maps |
+| `batch_size` | `1000` | Ligands per Uni-Dock process. Main lever for GPU utilisation |
+| `max_gpu_memory` | `0` | MB cap. `0` means no cap. Set to about 75% of VRAM if OOM occurs |
+| `timeout` | `7200` | Seconds per sub-batch. `0` disables the timeout |
+| `refine_step` | `0` | Uni-Dock refinement steps. `0` omits the flag |
+| `seed` | `0` | Random seed. `0` means non-deterministic |
+
+**`[CHUNK]`**
+
+| Key | Default | Effect |
+|---|---|---|
+| `chunk_size` | `5000` | Ligands per dispatch unit: one job file, one chunk CSV |
+
+`chunk_size` and `batch_size` are different units. A chunk of 5000 runs as five
+sub-batches of 1000 inside one worker. Larger chunks reduce dispatch overhead;
+smaller chunks distribute the tail of a target more evenly across GPUs.
+
+### config/rescore.ini
+
+**`[PATHS]`.** `target_dir`, `results_dir` and `log_dir`, all required.
+`results_dir` and `target_dir` must match the values in `docking.ini`;
+`check_config.py` verifies this.
+
+**`[GPU]`.** Same two keys as in `docking.ini`. The orchestrator reads them in
+the rescore stage too. Without this section `num_gpus` falls back to 1 and
+rescoring runs on a single GPU.
+
+**`[RESCORE]`, scoring functions.** Each is switched on and weighted separately. At least one must be active.
+
+| Key | Default | Score | Direction |
+|---|---|---|---|
+| `vina_enabled` | `true` | From `REMARK VINA RESULT` in the pose file. No extra cost | smaller better |
+| `vinardo_enabled` | `false` | `gnina --score_only --scoring vinardo`. One extra pass per ligand | smaller better |
+| `ad4_enabled` | `false` | `gnina --score_only --scoring ad4_scoring`. One extra pass per ligand | smaller better |
+| `cnnaffinity_enabled` | `false` | gnina CNNaffinity, predicted pK | larger better |
+| `cnnscore_enabled` | `false` | gnina CNNscore, pose quality in [0,1] | larger better |
+| `deltalinf9xgb_enabled` | `false` | Lin_F9 + XGBoost, separate conda env | larger better |
+| `dense_enabled` | `false` | Second CNN model, adds `dense_cnnaffinity` and `dense_cnnscore` | larger better |
+
+`vina_enabled` reads the value the docking used. With `[UNIDOCK] scoring = vinardo`
+the column `score_vina` holds Vinardo values; `check_config.py` warns about this.
+
+**`[RESCORE]`, consensus weights.** All zero means equal weighting over the
+active functions. Otherwise weights normalise to 1 over the active set.
+
+| Key | Default |
+|---|---|
+| `w_vina` | `0.0` |
+| `w_vinardo` | `0.0` |
+| `w_ad4` | `0.0` |
+| `w_cnnaffinity` | `0.0` |
+| `w_cnnscore` | `0.0` |
+| `w_deltalinf9xgb` | `0.0` |
+| `w_dense_cnnaffinity` | `0.0` |
+| `w_dense_cnnscore` | `0.0` |
+
+**`[RESCORE]`, execution.**
+
+| Key | Default | Effect |
+|---|---|---|
+| `enabled` | `true` | Master switch for the whole stage |
+| `sigma_fraction` | `4.0` | Decay parameter of the consensus. Larger means sharper decay |
+| `cnn_model` | `crossdock_default2018_ensemble` | gnina CNN model |
+| `dense_model` | `dense_ensemble` | Second model, used when `dense_enabled` |
+| `gnina_binary` | *(empty)* | Path to gnina. Empty falls back to autodetection via PATH |
+| `gnina_use_gpu` | `true` | `false` forces `--no_gpu` |
+| `n_jobs` | `1` | joblib workers for the CLI path. `-1` uses all cores |
+| `rescore_batch_size` | `0` | Poses per GPU batch. `0` derives it from available VRAM |
+| `cluster_poses` | `false` | RMSD clustering before scoring, reduces the number of poses |
+| `cluster_rmsd_cutoff` | `2.0` | Ångström threshold for clustering |
+| `deltalinf9xgb_n_workers` | `1` | Scoring workers for ΔLin_F9XGB |
+| `deltalinf9xgb_prep_workers` | `0` | MOL2 preparation workers. `0` mirrors `n_workers` |
+| `rescore_num_gpus` | `0` | GPUs for rescoring. `0` uses the `[GPU]` setting |
+| `rescore_cuda_device_id` | `0` | Which GPU when `rescore_num_gpus = 1` |
+
+**`[REFINEMENT]`.** Runs after rescoring on the best-ranked ligands.
+
+| Key | Default | Effect |
+|---|---|---|
+| `enabled` | `false` | Master switch |
+| `top_fraction` | `0.15` | Fraction of the ECR ranking to refine |
+| `refinement_mode` | `local_only` | `local_only`, `minimize`, or `autobox` |
+| `autobox_extend` | `4.0` | Ångström padding, only for `refinement_mode = autobox` |
+| `cnn_model` | `crossdock_default2018_ensemble` | gnina CNN model |
+| `exhaustiveness` | `0` | `0` means local optimisation without a new search |
+| `num_modes` | `1` | Poses per refined ligand |
+| `use_gpu` | `true` | GPU for the refinement runs |
+| `gnina_binary` | *(empty)* | Path to gnina, autodetected when empty |
+
+### Target definition
+
+`TARGET/config.txt` is not an INI. One block per receptor, blocks separated by
+blank lines:
+
+```
+BRD4
+CENTER [12.5, -8.3, 22.1]
+BOX_SIZE [25.0, 25.0, 25.0]
+
+CDK2
+CENTER [4.1, 15.7, -3.2]
+BOX_SIZE [22.0, 22.0, 22.0]
+LIGAND_SUBDIR = cdk2_dude
 ```
 
-`config/rescore.ini` — which scoring functions contribute and how they are
-weighted in the consensus:
+| Field | Required | Meaning |
+|---|---|---|
+| name | yes | First line of the block. Needs a matching `<name>.pdbqt` in `target_dir` |
+| `CENTER` | yes | Box centre in Ångström |
+| `BOX_SIZE` | yes | Box dimensions in Ångström |
+| `LIGAND_SUBDIR` | no | Restricts this target to a subdirectory of `pdbqt_dir` |
 
-```ini
-[RESCORE]
-# empirical (Vina family)
-vina_enabled          = true    # read from the pose file, free
-vinardo_enabled       = false   # one extra gnina --score_only pass
-ad4_enabled           = false   # one extra gnina --score_only pass
-# learned
-cnnaffinity_enabled   = true
-cnnscore_enabled      = true
-deltalinf9xgb_enabled = false
-
-sigma_fraction        = 4.0
-w_vina                = 0.0     # all zero -> equal weights over active scores
-```
-
-Every scoring function is individually switchable and individually weighted.
-Weights normalise over the *active* functions only, so disabling one does not
-silently reweight the others. The Vina-family functions are strongly correlated
-with each other, so enabling all three under equal weighting gives the empirical
-view three votes against one each for the learned scores. `check_config.py`
-warns about this.
-
-`check_config.py` verifies that the handover paths (`results_dir`, `target_dir`)
-agree between the two files and that value ranges are sane. It runs automatically
-before each pipeline start.
-
----
+Lines starting with `#` are comments. A receptor whose PDBQT is missing produces
+a warning and is skipped rather than aborting the run.
 
 ## Consensus ranking
 
-Scores from different functions are combined by exponential consensus ranking
-(Palacio-Rodríguez et al., *Sci Rep* **9**, 5142, 2019):
+Scores from different functions are combined by **exponential consensus ranking**
+(Palacio-Rodríguez et al., *Sci Rep* **9**, 5142, 2019). ECR ranks poses per scoring function and
+combines the ranks. Scores on incompatible scales, such as a Vina energy in
+kcal/mol and a CNN classification score in $[0,1]$, can therefore be combined
+without normalisation.
 
-```
-ECR_j(r) = exp(-r / σ)          r = rank of the pose under score j
-P(pose)  = Σ_j ECR_j(r_j)       σ = N / sigma_fraction
-P(ligand) = max over its poses
-```
+### Step 1 — Direction correction
 
-Scores where larger is better (CNNaffinity, CNNscore, ΔLin_F9XGB) are inverted
-before ranking. Weights normalise over the active functions only, so disabling a
-score does not silently reweight the rest.
+Every score is normalised so that **smaller is better** before ranking. Functions
+that report "larger is better" are negated:
+
+| Score | Raw output | Direction | Stored as |
+|---|---|---|---|
+| `vina` | kcal/mol | smaller better | $s$ |
+| `vinardo` | kcal/mol | smaller better | $s$ |
+| `ad4` | kcal/mol | smaller better | $s$ |
+| `cnnaffinity` | predicted pK | larger better | $-s$ |
+| `cnnscore` | $[0,1]$ | larger better | $-s$ |
+| `deltalinf9xgb` | predicted pK$_d$ | larger better | $-s$ |
+| `dense_cnnaffinity` | predicted pK | larger better | $-s$ |
+| `dense_cnnscore` | $[0,1]$ | larger better | $-s$ |
+
+### Step 2 — Per-score ranking
+
+For each active scoring function $j$, all poses of the target that carry a valid
+value are sorted ascending and assigned ranks $r_j \in \{1, 2, \dots\}$, so rank 1
+is the best pose under that function. Poses without a value for $j$ receive no
+rank and contribute nothing to that term.
+
+### Step 3 — Exponential weighting
+
+$$\mathrm{ECR}_j(\text{pose}) = e^{-r_j / \sigma}, \qquad \sigma = \max\left(\frac{N}{f}, 1\right)$$
+
+with $N$ the total number of poses of the target and $f$ the configurable
+`sigma_fraction` (default 4.0). The contribution decays exponentially with rank. A function that places a pose
+near the top contributes close to its full weight, one that places it in the
+tail contributes close to nothing. Larger $f$ gives smaller $\sigma$ and a
+sharper decay, so only the leading ranks carry weight.
+
+### Step 4 — Weighted sum per pose
+
+$$P(\text{pose}) = \sum_{j \in A} w_j \cdot \mathrm{ECR}_j(\text{pose})$$
+
+where $A$ is the set of active functions that actually produced data. Weights are
+normalised over $A$ only:
+
+$$w_j = \frac{w_j^{\text{ini}}}{\sum_{k \in A} w_k^{\text{ini}}}
+\qquad\text{or}\qquad w_j = \frac{1}{|A|} \;\text{ if all } w^{\text{ini}} = 0$$
+
+Disabling a function therefore does not silently reweight the others, and a
+function that was enabled but produced no values at all is dropped from $A$ with
+a warning rather than counted as zero.
+
+### Step 5 — Aggregation to ligands
+
+$$P(\text{ligand}) = \max_{\text{pose} \in \text{ligand}} P(\text{pose})$$
+
+The ligand inherits the score of its best pose; that pose index is reported as
+`best_pose`. Ligands are sorted by $P$ descending, so **larger ECR is better**,
+opposite to the underlying energies.
+
+### Output
+
+| File | Content |
+|---|---|
+| `rescoring_poses_<target>.csv` | every pose with all raw scores, ranks $r_j$, terms $\mathrm{ECR}_j$ and $P(\text{pose})$ |
+| `rescoring_ligands_<target>.csv` | ligand ranking by $P(\text{ligand})$ — the main result |
+
+The pose-level CSV contains all intermediate values, so $P$ can be recomputed
+from the columns and the weighting can be changed offline without re-running any
+scoring.
+
+### Worked example
+
+Three ligands, two poses each, two active functions at equal weight
+($N = 6$, $f = 4$, therefore $\sigma = 1.5$):
+
+| Pose | $s_\text{vina}$ | $s_\text{cnn}$ | $r_\text{vina}$ | $r_\text{cnn}$ | $\mathrm{ECR}_\text{vina}$ | $\mathrm{ECR}_\text{cnn}$ | $P$ |
+|---|---|---|---|---|---|---|---|
+| ligA/1 | −9.0 | −0.90 | 2 | 2 | 0.2636 | 0.2636 | **0.2636** |
+| ligA/2 | −8.0 | −0.70 | 4 | 3 | 0.0695 | 0.1353 | 0.1024 |
+| ligB/1 | −9.5 | −0.40 | 1 | 4 | 0.5134 | 0.0695 | **0.2915** |
+| ligB/2 | −7.0 | — | 5 | — | 0.0357 | 0.0000 | 0.0178 |
+| ligC/1 | −8.5 | −0.95 | 3 | 1 | 0.1353 | 0.5134 | **0.3244** |
+| ligC/2 | −6.0 | −0.10 | 6 | 5 | 0.0183 | 0.0357 | 0.0270 |
+
+Final ranking: **ligC** (0.3244) > **ligB** (0.2915) > **ligA** (0.2636).
+
+ligB/1 has the best Vina energy in the set but ranks fourth on CNN, so it loses
+to ligC/1, which is third on Vina and first on CNN. A Vina-only ranking would
+have placed ligB first. ligB/2 shows the handling of missing values: the absent
+CNN score contributes zero to that term, which penalises the pose rather than
+treating it as neutral.
+
+### Deviations from the original formulation
+
+Two points where this implementation differs from the paper. Both are
+deliberate, but they matter when comparing against published numbers.
+
+- **Ranking happens at pose level, not ligand level.** All poses of all ligands
+  of a target compete in one ranking, and the per-ligand value is taken as the
+  maximum afterwards. $\sigma$ is therefore derived from the pose count, not the
+  ligand count. With `num_modes = 9` that makes $\sigma$ about nine times larger
+  than a ligand-level formulation would give, which flattens the decay.
+- **Ties are broken arbitrarily** by sort order rather than receiving a shared
+  rank. With continuous scores exact ties are rare; with `cnnscore` saturating
+  at 1.0 they are not impossible.
 
 ---
 
@@ -244,12 +470,11 @@ python3 src/check_config.py  config/
 python3 src/check_ligands.py data/PDBQT
 ```
 
-`check_ligands.py` catches the failure mode that is easiest to miss: the
-converter derives filenames from SDF titles, so two molecules sharing a title
-produce the same filename. Docking results are written flat per target, meaning
-such ligands overwrite each other silently and the run finishes with a plausible
-but incomplete result table. The check aborts the pipeline before any GPU time
-is spent.
+`check_ligands.py` covers a failure mode that produces no error message: the
+converter derives filenames from SDF titles, so two molecules with the same
+title get the same filename. Docking results are written flat per target, so
+those ligands overwrite each other and the run ends with a plausible but
+incomplete result table. The check aborts before any GPU time is spent.
 
 ---
 
@@ -272,9 +497,9 @@ This section will be updated once those numbers exist.
   but they do bias the screened set toward smaller, less flexible molecules.
 - Stage 1 keeps only the largest fragment of multi-component entries, which is
   the right behaviour for salts but is applied without reporting.
-- `parse_target_config` exists in two implementations — `pipeline_common.py` and
-  a standalone copy inside `docking_rescore.py`. Changes to the `config.txt`
-  format must currently be made in both.
+- `parse_target_config` exists twice: in `pipeline_common.py` and as a standalone
+  copy inside `docking_rescore.py`. Changes to the `config.txt` format have to be
+  made in both.
 - No automated test suite.
 
 ---
