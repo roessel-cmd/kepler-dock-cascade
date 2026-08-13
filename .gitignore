@@ -1,0 +1,68 @@
+# ── Container images ────────────────────────────────────────────────
+# Multi-GB Apptainer images belong in a release or a registry, not in git.
+*.sif
+*.simg
+
+# ── Binaries fetched at build time ──────────────────────────────────
+build/gnina
+build/*.tar.gz
+build/*.tar.bz2
+
+# ── Input libraries ─────────────────────────────────────────────────
+# Screening libraries are large and usually licensed. Track a small
+# example instead: LIB/example.sdf can be force-added if wanted.
+LIB/*
+!LIB/.gitkeep
+!LIB/README.md
+
+# ── Receptors ───────────────────────────────────────────────────────
+# config.txt IS tracked (it documents the binding sites); the PDBQTs
+# usually are not, since they are derived from PDB entries.
+TARGET/*.pdbqt
+!TARGET/config.txt
+!TARGET/.gitkeep
+
+# ── Generated data ──────────────────────────────────────────────────
+data/*
+!data/LOG/
+!data/PDBQT/
+data/LOG/*
+data/PDBQT/*
+!data/LOG/.gitkeep
+!data/PDBQT/.gitkeep
+
+RESULTS/*
+!RESULTS/.gitkeep
+
+# ── Logs ────────────────────────────────────────────────────────────
+*.log
+pipeline_*.log
+
+# ── Uni-Dock scratch ────────────────────────────────────────────────
+.unidock_tmp/
+**/.unidock_tmp/
+chunk_gpu*_*.txt
+*.job
+*.done
+SHUTDOWN
+
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# ── Editors / OS ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ── Local overrides ─────────────────────────────────────────────────
+# Keep the committed INIs as the documented defaults; work on copies.
+config/*.local.ini
+pipeline_start.local.sh

@@ -1,0 +1,70 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+%labels
+    Author       sdf_to_pdbqt
+    Version      1.1.0
+    Description  Standalone SDF→PDBQT Konverter (RDKit + Meeko)
+
+%files
+    sdf_to_pdbqt.py /opt/sdf_to_pdbqt.py
+
+%post
+    set -eu
+
+    # mambaorg/micromamba laeuft als unprivilegierter User 'mambauser'.
+    # Fuer apt-get brauchen wir root — in Apptainer-Builds sind wir das per default.
+    apt-get update && apt-get install -y --no-install-recommends \
+        tini ca-certificates && \
+        rm -rf /var/lib/apt/lists/*
+
+    # micromamba in die base-Umgebung — MAMBA_ROOT_PREFIX ist /opt/conda im Image
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    micromamba install -y -n base -c conda-forge \
+        python=3.11 \
+        rdkit \
+        numpy \
+        scipy \
+        pip
+    micromamba clean -afy
+
+    # Meeko via pip (PyPI ist aktueller als conda-forge)
+    # gemmi ist seit neueren Meeko-Versionen Pflicht (wird ueber meeko.polymer importiert),
+    # aber nicht automatisch als Dependency gezogen — daher explizit.
+    /opt/conda/bin/pip install --no-cache-dir gemmi "meeko>=0.6,<1.0"
+
+    chmod 0755 /opt/sdf_to_pdbqt.py
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH=/opt/conda/bin:$PATH
+
+%runscript
+    # tini als PID 1 — saubere Signal-Weitergabe an Kindprozesse,
+    # wichtig damit unsere SIGALRM-Timeout-Logik zuverlaessig funktioniert
+    exec /usr/bin/tini -- /opt/conda/bin/python /opt/sdf_to_pdbqt.py "$@"
+
+%test
+    # Smoke-Test beim Build: Importe muessen funktionieren
+    /opt/conda/bin/python -c "from rdkit import Chem; from meeko import MoleculePreparation, PDBQTWriterLegacy; print('imports OK')"
+
+%help
+    Standalone SDF → PDBQT Konverter (RDKit + Meeko, kein PDB-Umweg).
+    Streamt eine grosse Sammel-SDF (Millionen Molekuele moeglich).
+
+    Build:
+        apptainer build sdf_to_pdbqt.sif sdf_to_pdbqt.def
+
+    Aufruf (Sammel-SDF wird unter /data/sdf/library.sdf eingebunden):
+        apptainer run \
+            --bind /path/to/LIB:/data/sdf \
+            --bind /path/to/PDBQT_NEW:/data/pdbqt \
+            --bind /path/to/LOG:/data/log \
+            sdf_to_pdbqt.sif \
+            --sdf-file /data/sdf/library.sdf \
+            --out-dir  /data/pdbqt \
+            --log-dir  /data/log \
+            --workers  15 \
+            --timeout  120

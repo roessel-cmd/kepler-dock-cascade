@@ -1,0 +1,77 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite both this repository and the
+  underlying methods listed in THIRD_PARTY.md — the docking and scoring
+  are performed by Uni-Dock and gnina.
+title: "kepler-dock-cascade: a three-stage multi-GPU pipeline for high-throughput virtual screening"
+abstract: >-
+  A containerised pipeline that chains ligand preparation (RDKit + Meeko),
+  GPU docking (Uni-Dock), and consensus rescoring (gnina CNN scores,
+  ΔLin_F9XGB, exponential consensus ranking) into three independently
+  runnable stages with crash-resilient restart.
+type: software
+
+authors:
+  - given-names: ""            # ← your first name
+    family-names: ""           # ← your last name
+    affiliation: ""            # ← institution
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+
+repository-code: "https://github.com/roessel-cmd/kepler-dock-cascade"
+# url: "https://github.com/roessel-cmd/kepler-dock-cascade"
+# license: ""                  # ← SPDX identifier, see THIRD_PARTY.md first
+version: "1.0.0"
+date-released: "2026-08-13"
+
+keywords:
+  - virtual screening
+  - molecular docking
+  - GPU computing
+  - drug discovery
+  - structure-based drug design
+  - consensus scoring
+
+references:
+  - type: article
+    title: "Uni-Dock: GPU-Accelerated Docking Enables Ultralarge Virtual Screening"
+    authors:
+      - family-names: Yu
+        given-names: Yuejiang
+      - family-names: Cai
+        given-names: Chun
+      - family-names: Wang
+        given-names: Jintai
+      - family-names: Bo
+        given-names: Zhengdan
+      - family-names: Zhu
+        given-names: Zhengyang
+      - family-names: Zheng
+        given-names: Hang
+    journal: "Journal of Chemical Theory and Computation"
+    year: 2023
+
+  - type: article
+    title: "GNINA 1.0: molecular docking with deep learning"
+    authors:
+      - family-names: McNutt
+        given-names: Andrew T.
+    journal: "Journal of Cheminformatics"
+    volume: 13
+    start: 43
+    year: 2021
+
+  - type: article
+    title: "Exponential consensus ranking improves the outcome in docking and receptor ensemble docking"
+    authors:
+      - family-names: Palacio-Rodríguez
+        given-names: Karen
+      - family-names: Lans
+        given-names: Isaias
+      - family-names: Cavasotto
+        given-names: Claudio N.
+      - family-names: Cossio
+        given-names: Pilar
+    journal: "Scientific Reports"
+    volume: 9
+    start: 5142
+    year: 2019

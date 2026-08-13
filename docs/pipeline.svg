@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 740" width="960" height="740" role="img" aria-label="Three-stage virtual screening pipeline: preparation, docking, rescoring">
+<title>dock-cascade pipeline (light)</title>
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/></marker>
+</defs>
+<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,'Helvetica Neue',Arial,sans-serif">
+<rect x="60" y="52" width="200" height="34" rx="17" fill="#F1F5F9" stroke="#CBD5E1"/>
+<text x="80" y="74" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="14" fill="#475569">LIB/*.sdf</text>
+<text x="284" y="74" font-size="13" fill="#64748B">input library</text>
+<line x1="110" y1="86" x2="110" y2="122" stroke="#94A3B8" stroke-width="2" marker-end="url(#ah)"/>
+<rect x="60" y="128" width="840" height="116" rx="16" fill="#F0FDFA" stroke="#5EEAD4" stroke-width="1.5"/>
+<path d="M61 144 a15,15 0 0 1 15,-15 h6 v114 h-6 a15,15 0 0 1 -15,-15 z" fill="#0D9488"/>
+<rect x="88" y="154" width="44" height="44" rx="12" fill="#0D9488"/>
+<text x="110" y="184" text-anchor="middle" font-size="22" font-weight="700" fill="#FFFFFF">1</text>
+<text x="152" y="175" font-size="19" font-weight="600" fill="#0F172A" letter-spacing="0.4">PREPARATION</text>
+<text x="152" y="200" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="13" fill="#64748B">sdf_to_pdbqt.sif</text>
+<rect x="152" y="212" width="52" height="22" rx="11" fill="none" stroke="#0D9488" stroke-width="1.2"/>
+<text x="178.0" y="227" text-anchor="middle" font-size="11" font-weight="600" fill="#0D9488" letter-spacing="0.6">CPU</text>
+<line x1="380" y1="156" x2="380" y2="216" stroke="#5EEAD4" stroke-width="1.5"/>
+<text x="408" y="180" font-size="15" fill="#475569">RDKit + Meeko, parallel process pool</text>
+<text x="408" y="206" font-size="15" fill="#475569">SDF → PDBQT directly, no PDB intermediate</text>
+<rect x="60" y="320" width="840" height="116" rx="16" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+<path d="M61 336 a15,15 0 0 1 15,-15 h6 v114 h-6 a15,15 0 0 1 -15,-15 z" fill="#2563EB"/>
+<rect x="88" y="346" width="44" height="44" rx="12" fill="#2563EB"/>
+<text x="110" y="376" text-anchor="middle" font-size="22" font-weight="700" fill="#FFFFFF">2</text>
+<text x="152" y="367" font-size="19" font-weight="600" fill="#0F172A" letter-spacing="0.4">DOCKING</text>
+<text x="152" y="392" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="13" fill="#64748B">unidock-gpu.sif</text>
+<rect x="152" y="404" width="52" height="22" rx="11" fill="none" stroke="#2563EB" stroke-width="1.2"/>
+<text x="178.0" y="419" text-anchor="middle" font-size="11" font-weight="600" fill="#2563EB" letter-spacing="0.6">GPU</text>
+<line x1="380" y1="348" x2="380" y2="408" stroke="#93C5FD" stroke-width="1.5"/>
+<text x="408" y="372" font-size="15" fill="#475569">Uni-Dock, one persistent worker per GPU</text>
+<text x="408" y="398" font-size="15" fill="#475569">Batched ligands, work-stealing chunk queue</text>
+<rect x="60" y="512" width="840" height="116" rx="16" fill="#FAF5FF" stroke="#D8B4FE" stroke-width="1.5"/>
+<path d="M61 528 a15,15 0 0 1 15,-15 h6 v114 h-6 a15,15 0 0 1 -15,-15 z" fill="#7C3AED"/>
+<rect x="88" y="538" width="44" height="44" rx="12" fill="#7C3AED"/>
+<text x="110" y="568" text-anchor="middle" font-size="22" font-weight="700" fill="#FFFFFF">3</text>
+<text x="152" y="559" font-size="19" font-weight="600" fill="#0F172A" letter-spacing="0.4">RESCORING</text>
+<text x="152" y="584" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="13" fill="#64748B">rescoring-gpu.sif</text>
+<rect x="152" y="596" width="52" height="22" rx="11" fill="none" stroke="#7C3AED" stroke-width="1.2"/>
+<text x="178.0" y="611" text-anchor="middle" font-size="11" font-weight="600" fill="#7C3AED" letter-spacing="0.6">GPU</text>
+<line x1="380" y1="540" x2="380" y2="600" stroke="#D8B4FE" stroke-width="1.5"/>
+<text x="408" y="564" font-size="15" fill="#475569">gnina CNNaffinity · CNNscore · ΔLin_F9XGB</text>
+<text x="408" y="590" font-size="15" fill="#475569">Exponential consensus ranking, refinement</text>
+<line x1="110" y1="244" x2="110" y2="314" stroke="#94A3B8" stroke-width="2" marker-end="url(#ah)"/>
+<text x="132" y="287.0" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="13" fill="#64748B">data/PDBQT/</text>
+<line x1="110" y1="436" x2="110" y2="506" stroke="#94A3B8" stroke-width="2" marker-end="url(#ah)"/>
+<text x="132" y="479.0" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="13" fill="#64748B">RESULTS/&lt;target&gt;/*_docked.pdbqt</text>
+<line x1="110" y1="628" x2="110" y2="662" stroke="#94A3B8" stroke-width="2" marker-end="url(#ah)"/>
+<rect x="60" y="670" width="420" height="34" rx="17" fill="#F1F5F9" stroke="#CBD5E1"/>
+<text x="80" y="692" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="13" fill="#475569">RESULTS/&lt;target&gt;/rescoring_ligands_&lt;target&gt;.csv</text>
+<text x="504" y="692" font-size="13" fill="#64748B">ranked hit list</text>
+</g>
+</svg>

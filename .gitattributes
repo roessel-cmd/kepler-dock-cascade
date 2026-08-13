@@ -1,0 +1,41 @@
+# ============================================================================
+# .gitattributes
+# Erzwingt Unix-Zeilenumbrueche fuer alles, was auf dem Linux-Server
+# ausgefuehrt oder geparst wird.
+#
+# Hintergrund: Wird das Repo unter Windows gepflegt und auf Linux geklont,
+# wandelt Git ohne diese Datei LF in CRLF um. Shell-Skripte scheitern dann
+# mit "bad interpreter: /bin/bash^M", und Apptainer-Definitionsdateien
+# brechen im %post-Block ab – beides mit Fehlermeldungen, die nicht auf
+# die eigentliche Ursache zeigen.
+# ============================================================================
+
+# Standard: Git entscheidet, im Arbeitsverzeichnis lokale Konvention
+* text=auto
+
+# Ausfuehrbares und Interpretiertes: IMMER LF, egal auf welchem System
+*.sh        text eol=lf
+*.py        text eol=lf
+*.def       text eol=lf
+*.ini       text eol=lf
+*.cff       text eol=lf
+*.md        text eol=lf
+.gitignore  text eol=lf
+
+# Target-Konfiguration und Molekuelformate: LF, weil sie zeilenweise
+# geparst werden
+*.txt       text eol=lf
+*.pdbqt     text eol=lf
+*.sdf       text eol=lf
+
+# Binaerdateien: nie anfassen
+*.png       binary
+*.sif       binary
+*.tar.gz    binary
+*.bin       binary
+
+# SVG ist Text, wird aber in Diffs selten sinnvoll gelesen
+*.svg       text eol=lf linguist-generated=true
+
+# Sprachstatistik: docs/ nicht als Projektsprache zaehlen
+docs/*      linguist-documentation
