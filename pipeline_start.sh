@@ -40,7 +40,20 @@ CONTINUE_ON_ERROR=false
 # ════════════════════════════════════════════════════════════════════════════
 
 CONV_SIF="sdf_to_pdbqt.sif"
-CONV_LIB_DIR="LIB"             # Eingangs-SDFs
+CONV_LIB_DIR="LIB"             # Eingangsdateien
+
+# Welche Formate aus LIB/ eingesammelt werden. SDF ist der Standardweg;
+# SMILES-Listen sind eine Alternative fuer Faelle, in denen keine SDF
+# vorliegt. PDB fehlt bewusst: das Format kennt keine Bindungsordnungen.
+#   sdf     nur *.sdf und *.sdf.gz
+#   smiles  nur *.smi, *.csv, *.tsv
+#   all     beides
+CONV_INPUT_TYPES="sdf"
+
+# Spaltenzuordnung fuer SMILES-Listen. Leer = automatisch: Kopfzeile wird
+# ausgewertet, sonst .csv = Name,SMILES und .smi = SMILES Name.
+CONV_SMILES_COL=""
+CONV_NAME_COL=""
 CONV_OUT_DIR="data/PDBQT"      # muss [PATHS] pdbqt_dir aus docking.ini entsprechen
 CONV_WORKERS=15
 CONV_TIMEOUT=120               # Sekunden pro Molekuel
@@ -223,18 +236,30 @@ if [ "$RUN_CONVERSION" = true ]; then
     require_file "$PROJECT_DIR/$CONV_SIF" "Container fuer Stufe 1" || exit 1
 
     shopt -s nullglob
-    SDF_FILES=("$PROJECT_DIR/$CONV_LIB_DIR"/*.sdf)
+    SDF_FILES=()
+    case "$CONV_INPUT_TYPES" in
+        sdf|all)
+            SDF_FILES+=("$PROJECT_DIR/$CONV_LIB_DIR"/*.sdf
+                        "$PROJECT_DIR/$CONV_LIB_DIR"/*.sdf.gz) ;;
+    esac
+    case "$CONV_INPUT_TYPES" in
+        smiles|all)
+            SDF_FILES+=("$PROJECT_DIR/$CONV_LIB_DIR"/*.smi
+                        "$PROJECT_DIR/$CONV_LIB_DIR"/*.csv
+                        "$PROJECT_DIR/$CONV_LIB_DIR"/*.tsv) ;;
+    esac
     shopt -u nullglob
 
     if [ ${#SDF_FILES[@]} -eq 0 ]; then
-        err "Keine .sdf-Dateien in $PROJECT_DIR/$CONV_LIB_DIR"
+        err "Keine Eingabedateien ($CONV_INPUT_TYPES) in $PROJECT_DIR/$CONV_LIB_DIR"
         RC=1
     else
         say "${#SDF_FILES[@]} SDF-Datei(en) gefunden"
         mkdir -p "$PROJECT_DIR/$CONV_OUT_DIR"
 
         for sdf in "${SDF_FILES[@]}"; do
-            stem="$(basename "$sdf" .sdf)"
+            base="$(basename "$sdf")"
+            stem="${base%.gz}"; stem="${stem%.*}"
 
             if [ "$CONV_SUBDIR_PER_SDF" = true ] && [ ${#SDF_FILES[@]} -gt 1 ]; then
                 out_sub="$CONV_OUT_DIR/$stem"
@@ -247,9 +272,14 @@ if [ "$RUN_CONVERSION" = true ]; then
             n_done=$(find "$PROJECT_DIR/$out_sub" -name '*.pdbqt' -type f 2>/dev/null | wc -l)
             n_fail=$(find "$LOG_DIR" -name '*_convert_error.log' -type f 2>/dev/null | wc -l)
             # "$$$$" trennt Molekuele im SDF; bei .gz entsprechend dekomprimiert
-            case "$sdf" in
-                *.gz) n_total=$(zgrep -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
-                *)    n_total=$(grep  -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+            case "$base" in
+                *.sdf.gz) n_total=$(zgrep -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+                *.sdf)    n_total=$(grep  -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+                # SMILES-Liste: nichtleere Zeilen ohne Kommentare; eine
+                # eventuelle Kopfzeile zaehlt mit, die Bilanz ist also um
+                # hoechstens eins zu hoch.
+                *.gz)     n_total=$(zgrep -cvE '^\s*(#|$)' "$sdf" 2>/dev/null || echo 0) ;;
+                *)        n_total=$(grep  -cvE '^\s*(#|$)' "$sdf" 2>/dev/null || echo 0) ;;
             esac
             n_handled=$(( n_done + n_fail ))
 
@@ -268,7 +298,7 @@ if [ "$RUN_CONVERSION" = true ]; then
             fi
 
             CONV_ARGS=(
-                --sdf-file "/data/sdf/$(basename "$sdf")"
+                --input    "/data/sdf/$base"
                 --out-dir  "/data/pdbqt"
                 --log-dir  "/data/log"
                 --workers  "$CONV_WORKERS"
@@ -277,6 +307,8 @@ if [ "$RUN_CONVERSION" = true ]; then
             )
             [ "$CONV_FLAT" = true ]   && CONV_ARGS+=(--flat)
             [ "$CONV_RESUME" = true ] && CONV_ARGS+=(--skip-existing)
+            [ -n "$CONV_SMILES_COL" ] && CONV_ARGS+=(--smiles-col "$CONV_SMILES_COL")
+            [ -n "$CONV_NAME_COL" ]   && CONV_ARGS+=(--name-col   "$CONV_NAME_COL")
 
             run apptainer run \
                 --bind "$PROJECT_DIR/$CONV_LIB_DIR:/data/sdf" \
