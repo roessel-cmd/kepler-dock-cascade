@@ -128,7 +128,7 @@ def _run_rescore_worker(gpu, sif, project_dir, ini_path,
     # Lokale Quellen binden (Entwicklermodus)
     for pyfile in ["worker_rescore.py", "docking_rescore.py",
                     "gnina_gpu_worker.py", "gnina_refinement.py",
-                    "linf9xgb_scorer.py"]:
+                    "linf9xgb_scorer.py", "ecr.py"]:
         local = project_dir / "src" / pyfile
         if local.exists():
             cmd += ["--bind", f"{local}:/app/{pyfile}"]
@@ -186,7 +186,7 @@ def run_rescoring(sif, project_dir, ini_path, targets=None, gpus=None):
     ]
     for pyfile in ["worker_rescore.py", "docking_rescore.py",
                     "gnina_gpu_worker.py", "gnina_refinement.py",
-                    "linf9xgb_scorer.py"]:
+                    "linf9xgb_scorer.py", "ecr.py"]:
         local = project_dir / "src" / pyfile
         if local.exists():
             cmd += ["--bind", f"{local}:/app/{pyfile}"]

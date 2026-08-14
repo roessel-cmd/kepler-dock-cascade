@@ -40,6 +40,7 @@ Aufruf
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
 import multiprocessing as mp
 import signal
@@ -125,7 +126,7 @@ def worker_loop(worker_id: int,
     """
     Holt Jobs aus der Queue bis SENTINEL, konvertiert, meldet Ergebnis.
 
-    Job:    (mol_index, mol_block_str, mol_name)
+    Job:    (mol_index, payload, mol_name, fmt)   fmt ∈ {"sdf", "smiles"}
     Result: (mol_index, mol_name, status, msg)
             status ∈ {"OK", "ERROR", "TIMEOUT"}
     """
@@ -159,15 +160,21 @@ def worker_loop(worker_id: int,
         if job is SENTINEL:
             break
 
-        mol_index, mol_block, mol_name = job
+        mol_index, payload, mol_name, fmt = job
         out_path = make_output_path(out_dir, mol_name, mol_index, flat)
 
         signal.alarm(timeout_s)  # Stopuhr starten
         try:
             t0 = time.perf_counter()
-            mol = Chem.MolFromMolBlock(mol_block, removeHs=False, sanitize=True)
-            if mol is None:
-                raise ValueError("MolBlock konnte nicht geparst werden")
+            if fmt == "smiles":
+                mol = Chem.MolFromSmiles(payload)
+                if mol is None:
+                    raise ValueError(f"SMILES nicht parsebar: {payload[:80]}")
+            else:
+                mol = Chem.MolFromMolBlock(payload, removeHs=False,
+                                           sanitize=True)
+                if mol is None:
+                    raise ValueError("MolBlock konnte nicht geparst werden")
             t_parse = time.perf_counter()
 
             # ── SALT-STRIPPING ─────────────────────────────────────────
@@ -203,7 +210,13 @@ def worker_loop(worker_id: int,
             AllChem.UFFOptimizeMolecule(mol, maxIters=uff_iters)
             t_uff = time.perf_counter()
 
-            prep = MoleculePreparation(macrocycle_opening=False)
+            # Makrozyklen starr behandeln statt sie aufzubrechen.
+            # Setzt Meeko >= 0.7 voraus (bis 0.6 hiess der Parameter
+            # macrocycle_opening=False). Die Version ist in
+            # sdf_to_pdbqt.def auf 0.7.1 gepinnt; eine aeltere Meeko
+            # scheitert hier sofort mit TypeError statt still anders zu
+            # rechnen, was das gewuenschte Verhalten ist.
+            prep = MoleculePreparation(rigid_macrocycles=True)
             setups = prep.prepare(mol)
             if not setups:
                 raise ValueError("Meeko: kein MoleculeSetup")
@@ -268,37 +281,268 @@ def worker_loop(worker_id: int,
 
 
 # ======================================================================
+# EINGABEFORMATE
+# ======================================================================
+# Standard bleibt SDF. SMILES-Listen sind eine Alternative, kein Ersatz.
+#
+# Warum SMILES unproblematisch ist: die Bindungsordnung IST die Notation.
+# Es gibt nichts zu rekonstruieren. Da ChEMBL-SDFs ohnehin 2D sind und die
+# 3D-Struktur hier per ETKDG erzeugt wird, ist der Weg identisch – nur ohne
+# den MolBlock-Parse davor.
+#
+# PDB wird bewusst NICHT unterstuetzt: das Format kennt keine
+# Bindungsordnungen, RDKit muesste sie aus Atomabstaenden raten. Genau der
+# Informationsverlust, wegen dem diese Pipeline den Umweg ueber PDB meidet.
+
+SMILES_HEADER_ALIASES = ("smiles", "canonical_smiles", "smi", "structure")
+NAME_HEADER_ALIASES   = ("name", "id", "chembl_id", "molecule_chembl_id",
+                         "title", "compound", "compound_id", "identifier")
+
+
+def detect_input_format(path: Path) -> str:
+    """Erkennt das Eingabeformat an der Dateiendung."""
+    suffixes = [s.lower() for s in path.suffixes]
+    if ".gz" in suffixes:
+        suffixes = [s for s in suffixes if s != ".gz"]
+    ext = suffixes[-1] if suffixes else ""
+    if ext in (".sdf", ".sd", ".mol"):
+        return "sdf"
+    if ext in (".smi", ".smiles", ".csv", ".tsv", ".txt"):
+        return "smiles"
+    if ext == ".pdb":
+        raise ValueError(
+            "PDB wird nicht unterstuetzt: das Format enthaelt keine "
+            "Bindungsordnungen. Konvertiere zuerst nach SDF oder SMILES "
+            "mit einem Werkzeug, das die Konnektivitaet kennt."
+        )
+    raise ValueError(
+        f"Unbekannte Dateiendung '{ext}'. Erlaubt: .sdf, .smi, .csv, .tsv, "
+        f"jeweils optional .gz. Mit --input-format laesst es sich erzwingen."
+    )
+
+
+def _sniff_delimiter(line: str, path: Path) -> str | None:
+    """
+    Trennzeichen bestimmen. None bedeutet: an beliebigem Whitespace teilen.
+
+    Nur bei .csv/.tsv wird ein festes Trennzeichen verwendet, weil dort leere
+    Felder zwischen zwei Trennern bedeutungstragend sind. Bei .smi/.txt wird
+    immer an Whitespace geteilt: solche Dateien mischen in der Praxis Tabs und
+    Leerzeichen zeilenweise, ein einmal erkannter Tab wuerde die naechste
+    Zeile mit Leerzeichen dann falsch aufteilen.
+    """
+    ext = [x.lower() for x in path.suffixes if x.lower() != ".gz"]
+    ext = ext[-1] if ext else ""
+    if ext not in (".csv", ".tsv"):
+        return None
+    for delim in ("\t", ";", ","):
+        if delim in line:
+            return delim
+    return None
+
+
+def _resolve_columns(header_fields: list[str], path: Path,
+                     smiles_col: str, name_col: str) -> tuple[int, int, bool]:
+    """
+    Bestimmt (smiles_index, name_index, hat_kopfzeile).
+
+    Reihenfolge der Entscheidung:
+      1. Explizite --smiles-col / --name-col (Zahl oder Spaltenname)
+      2. Kopfzeile mit bekanntem Spaltennamen
+      3. Endung: .csv/.tsv -> name,smiles   |   .smi -> smiles name
+
+    Die dritte Regel folgt den jeweiligen Konventionen: das .smi-Format hat
+    SMILES traditionell zuerst, eine selbstgeschriebene CSV nennt ueblicherweise
+    erst den Namen.
+    """
+    lowered = [f.strip().lower() for f in header_fields]
+
+    def find(explicit: str, aliases: tuple) -> int | None:
+        if explicit:
+            if explicit.isdigit():
+                return int(explicit)
+            if explicit.strip().lower() in lowered:
+                return lowered.index(explicit.strip().lower())
+            raise ValueError(f"Spalte '{explicit}' nicht in der Kopfzeile: "
+                             f"{header_fields}")
+        for alias in aliases:
+            if alias in lowered:
+                return lowered.index(alias)
+        return None
+
+    s_idx = find(smiles_col, SMILES_HEADER_ALIASES)
+    n_idx = find(name_col,   NAME_HEADER_ALIASES)
+
+    has_header = (s_idx is not None or n_idx is not None) and not (
+        smiles_col.isdigit() if smiles_col else False
+    )
+
+    if s_idx is None or n_idx is None:
+        ext = [x.lower() for x in path.suffixes if x.lower() != ".gz"]
+        ext = ext[-1] if ext else ""
+        if ext in (".csv", ".tsv"):
+            s_idx = 1 if s_idx is None else s_idx
+            n_idx = 0 if n_idx is None else n_idx
+        else:                       # .smi-Konvention
+            s_idx = 0 if s_idx is None else s_idx
+            n_idx = 1 if n_idx is None else n_idx
+        has_header = False
+
+    return s_idx, n_idx, has_header
+
+
+def iter_smiles(path: Path, smiles_col: str = "", name_col: str = ""):
+    """
+    Liest eine SMILES-Liste und liefert (smiles, name) je Zeile.
+
+    Unterstuetzt CSV/TSV mit oder ohne Kopfzeile sowie das .smi-Format mit
+    Whitespace-Trennung. Leere Zeilen und Kommentarzeilen (#) werden
+    uebersprungen.
+    """
+    opener = (lambda p: gzip.open(p, "rt", encoding="utf-8", errors="replace")) \
+        if str(path).endswith(".gz") else \
+        (lambda p: open(p, "r", encoding="utf-8", errors="replace"))
+
+    with opener(path) as fh:
+        first = None
+        for line in fh:
+            if line.strip() and not line.lstrip().startswith("#"):
+                first = line.rstrip("\n")
+                break
+        if first is None:
+            return
+
+        delim  = _sniff_delimiter(first, path)
+        fields = first.split(delim) if delim else first.split()
+        s_idx, n_idx, has_header = _resolve_columns(
+            fields, path, smiles_col, name_col
+        )
+
+        if not has_header:
+            row = [f.strip() for f in fields]
+            if len(row) > s_idx and row[s_idx]:
+                yield row[s_idx], (row[n_idx] if len(row) > n_idx else "")
+
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            row = [f.strip() for f in (line.split(delim) if delim else line.split())]
+            if len(row) <= s_idx or not row[s_idx]:
+                continue
+            yield row[s_idx], (row[n_idx] if len(row) > n_idx else "")
+
+
+# ======================================================================
 # PRODUCER – streamt Sammel-SDF zeilenweise
 # ======================================================================
 
-def producer_loop(sdf_file_str: str,
-                  job_queue: mp.Queue,
-                  num_workers: int,
-                  control_queue: mp.Queue) -> None:
-    """
-    Liest die Sammel-SDF zeilenweise und splittet an '$$$$'-Trennern.
-    Sendet (index, mol_block, mol_name) in die job_queue.
-    Schliesst mit num_workers Sentinels und meldet Total-Count.
-
-    Bewusst kein ForwardSDMolSupplier: wir wollen den ROHEN MolBlock an
-    die Worker geben — RDKit parsen erfolgt dort. So kommt jeder kaputte
-    Block im Worker an, wird sauber als ERROR gemeldet, und der Producer
-    bleibt stabil.
-    """
-    sdf_path = Path(sdf_file_str)
-    sent = 0
-    with open(sdf_path, "r", encoding="utf-8", errors="replace") as fh:
+def _iter_sdf_blocks(sdf_path: Path):
+    """Liefert (mol_block, roher_name) je Eintrag der Sammel-SDF."""
+    opener = (lambda p: gzip.open(p, "rt", encoding="utf-8", errors="replace")) \
+        if str(sdf_path).endswith(".gz") else \
+        (lambda p: open(p, "r", encoding="utf-8", errors="replace"))
+    with opener(sdf_path) as fh:
         block_lines: list[str] = []
         for raw_line in fh:
             block_lines.append(raw_line)
             if raw_line.startswith("$$$$"):
-                mol_block = "".join(block_lines)
                 # SDF-Standard: Name ist die 1. Zeile des Blocks
                 first_line = block_lines[0].strip() if block_lines else ""
-                mol_name = safe_mol_name(first_line, sent)
-                job_queue.put((sent, mol_block, mol_name))
-                sent += 1
+                yield "".join(block_lines), first_line
                 block_lines = []
+
+
+def producer_loop(sdf_file_str: str,
+                  job_queue: mp.Queue,
+                  num_workers: int,
+                  control_queue: mp.Queue,
+                  out_dir_str: str = "",
+                  flat: bool = False,
+                  skip_existing: bool = False,
+                  input_format: str = "sdf",
+                  smiles_col: str = "",
+                  name_col: str = "",
+                  log_dir_str: str = "") -> None:
+    """
+    Liest die Eingabe und sendet (index, payload, name, format) in die
+    job_queue. Schliesst mit num_workers Sentinels.
+
+    Zwei Eingabeformate:
+      sdf     – Sammel-SDF, an '$$$$' gesplittet. Payload ist der ROHE
+                MolBlock; geparst wird im Worker, damit ein kaputter Block
+                dort sauber als ERROR landet und der Producer stabil bleibt.
+      smiles  – CSV/TSV/.smi-Liste. Payload ist der SMILES-String.
+
+    Duplikatpruefung: Der Dateiname entsteht aus dem Molekuelnamen, und die
+    Docking-Ergebnisse landen spaeter flach in einem Verzeichnis pro Target.
+    Zwei Eintraege mit gleichem Namen wuerden sich dort ueberschreiben, ohne
+    Fehlermeldung. Deshalb wird jeder Name nur einmal durchgelassen und die
+    Duplikate in duplicate_names.log geschrieben.
+    """
+    sdf_path = Path(sdf_file_str)
+    out_dir  = Path(out_dir_str) if out_dir_str else None
+    sent      = 0    # Index in der Eingabe – bestimmt den Unterordner
+    queued    = 0    # tatsaechlich in die Queue gelegt
+    skipped   = 0    # bereits konvertiert
+    duplicate = 0    # Name schon vergeben
+    unnamed   = 0    # kein Name in der Eingabe, Fallback mol_XXXXXXX
+
+    seen_names: set[str] = set()
+    dup_log = (Path(log_dir_str) / "duplicate_names.log") if log_dir_str else None
+    dup_fh = None
+
+    if input_format == "smiles":
+        source = ((smi, raw_name)
+                  for smi, raw_name in iter_smiles(sdf_path, smiles_col, name_col))
+    else:
+        source = _iter_sdf_blocks(sdf_path)
+
+    try:
+        for payload, raw_name in source:
+            if not raw_name.strip():
+                unnamed += 1
+            mol_name = safe_mol_name(raw_name, sent)
+
+            # Namenskollision: zweiter Eintrag wird verworfen, nicht
+            # ueberschrieben. Der Index laeuft weiter (siehe unten).
+            if mol_name in seen_names:
+                duplicate += 1
+                if dup_log is not None:
+                    if dup_fh is None:
+                        dup_fh = open(dup_log, "w", encoding="utf-8")
+                    dup_fh.write(f"{sent}\t{mol_name}\n")
+                sent += 1
+                continue
+            seen_names.add(mol_name)
+
+            # Wiederaufnahme: liegt das PDBQT schon, ueberspringen.
+            # Der Index sent laeuft trotzdem weiter, damit sich die
+            # Unterordner-Aufteilung nicht verschiebt – sonst landete
+            # dasselbe Molekuel beim naechsten Lauf woanders.
+            if skip_existing and out_dir is not None:
+                out_path = make_output_path(out_dir, mol_name, sent, flat)
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    sent += 1
+                    skipped += 1
+                    continue
+
+            job_queue.put((sent, payload, mol_name, input_format))
+            sent += 1
+            queued += 1
+    finally:
+        if dup_fh is not None:
+            dup_fh.close()
+
+    parts = [f"{sent:,} Eintraege gelesen", f"{queued:,} zu erledigen"]
+    if skipped:
+        parts.insert(1, f"{skipped:,} bereits konvertiert")
+    if duplicate:
+        parts.append(f"{duplicate:,} Namensduplikate verworfen"
+                     + (f" -> {dup_log}" if dup_log else ""))
+    if unnamed:
+        parts.append(f"{unnamed:,} ohne Namen (Fallback mol_XXXXXXX)")
+    print("[Producer] " + " | ".join(parts), flush=True)
 
     # Sentinel pro Worker
     for _ in range(num_workers):
@@ -343,10 +587,32 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Streaming SDF → PDBQT Konverter (RDKit + Meeko, kein PDB-Umweg)."
     )
-    ap.add_argument("--sdf-file", required=True, type=Path,
-                    help="Pfad zur Sammel-SDF (kann viele Molekuele enthalten).")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--sdf-file", type=Path,
+                     help="Pfad zur Sammel-SDF (kann viele Molekuele enthalten).")
+    src.add_argument("--input", type=Path, dest="input_file",
+                     help="Eingabedatei beliebigen unterstuetzten Formats: "
+                          ".sdf, .smi, .csv, .tsv, jeweils optional .gz. "
+                          "Gleichwertig zu --sdf-file, nur formatneutral benannt.")
+    ap.add_argument("--input-format", choices=["auto", "sdf", "smiles"],
+                    default="auto",
+                    help="Eingabeformat. 'auto' erkennt es an der Endung "
+                         "(default). PDB wird nicht unterstuetzt: das Format "
+                         "kennt keine Bindungsordnungen.")
+    ap.add_argument("--smiles-col", default="",
+                    help="Spalte mit dem SMILES: Name aus der Kopfzeile oder "
+                         "0-basierter Index. Ohne Angabe automatisch erkannt "
+                         "(Kopfzeile, sonst .csv=Spalte 1 / .smi=Spalte 0). "
+                         "Ein numerischer Index bedeutet: Datei ohne Kopfzeile.")
+    ap.add_argument("--name-col", default="",
+                    help="Spalte mit dem Molekuelnamen, analog zu --smiles-col "
+                         "(.csv=Spalte 0 / .smi=Spalte 1).")
     ap.add_argument("--out-dir",  required=True, type=Path,
                     help="Ausgabe-Verzeichnis fuer PDBQTs.")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Molekuele ueberspringen, deren PDBQT bereits "
+                         "vorhanden und nicht leer ist. Fuer die Wiederaufnahme "
+                         "eines abgebrochenen Laufs.")
     ap.add_argument("--log-dir",  required=True, type=Path,
                     help="Log-Verzeichnis (conversion.log + Per-Molekuel Errors).")
     ap.add_argument("--workers", type=int, default=15,
@@ -363,16 +629,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if not args.sdf_file.is_file():
-        print(f"FEHLER: SDF-Datei nicht gefunden: {args.sdf_file}", file=sys.stderr)
+    in_path = args.input_file if args.input_file is not None else args.sdf_file
+    if not in_path.is_file():
+        print(f"FEHLER: Eingabedatei nicht gefunden: {in_path}", file=sys.stderr)
         return 1
+
+    if args.input_format == "auto":
+        try:
+            in_format = detect_input_format(in_path)
+        except ValueError as exc:
+            print(f"FEHLER: {exc}", file=sys.stderr)
+            return 1
+    else:
+        in_format = args.input_format
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     args.log_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(args.log_dir)
 
-    logger.info("=== SDF → PDBQT KONVERTIERUNG (Streaming, RDKit + Meeko) ===")
-    logger.info("  Sammel-SDF       : %s", args.sdf_file)
+    logger.info("=== %s → PDBQT KONVERTIERUNG (Streaming, RDKit + Meeko) ===",
+                "SMILES" if in_format == "smiles" else "SDF")
+    logger.info("  Eingabe          : %s", in_path)
+    logger.info("  Eingabeformat    : %s", in_format)
     logger.info("  PDBQT-Output     : %s", args.out_dir)
     logger.info("  Log-Verzeichnis  : %s", args.log_dir)
     logger.info("  Worker           : %d", args.workers)
@@ -390,7 +668,9 @@ def main() -> int:
     # Producer starten
     producer = ctx.Process(
         target=producer_loop,
-        args=(str(args.sdf_file), job_queue, args.workers, control_queue),
+        args=(str(in_path), job_queue, args.workers, control_queue,
+              str(args.out_dir), args.flat, args.skip_existing,
+              in_format, args.smiles_col, args.name_col, str(args.log_dir)),
         name="producer",
         daemon=True,
     )

@@ -23,16 +23,23 @@ set -uo pipefail
 #  SCHALTER
 # ════════════════════════════════════════════════════════════════════════════
 
-RUN_CONVERSION=true      # Stufe 1: SDF → PDBQT
-RUN_DOCKING=true         # Stufe 2: Uni-Dock
-RUN_RESCORING=true       # Stufe 3: Rescoring + Refinement
+# Jeder Schalter laesst sich per Umgebungsvariable ueberschreiben, ohne die
+# Datei zu aendern:
+#     RUN_CONVERSION=false RUN_RESCORING=false ./pipeline_start.sh
+# Genau das nutzt slurm_pipeline.sh, um in der Kette nur zu docken – die
+# Konvertierung ist eine einmalige CPU-Aufgabe und hat in einem Job mit
+# vier belegten GPUs nichts verloren.
+
+RUN_CONVERSION="${RUN_CONVERSION:-true}"    # Stufe 1: SDF → PDBQT
+RUN_DOCKING="${RUN_DOCKING:-true}"          # Stufe 2: Uni-Dock
+RUN_RESCORING="${RUN_RESCORING:-true}"      # Stufe 3: Rescoring + Refinement
 
 # Vorabpruefungen (schnell, verhindern stundenlange Fehllaeufe)
-CHECK_CONFIG=true        # docking.ini gegen rescore.ini pruefen
-CHECK_LIGANDS=true       # PDBQT-Bibliothek pruefen (Layout, Namenskollisionen)
+CHECK_CONFIG="${CHECK_CONFIG:-true}"        # docking.ini gegen rescore.ini
+CHECK_LIGANDS="${CHECK_LIGANDS:-true}"      # PDBQT-Bibliothek pruefen
 
 # Bei Fehler einer Stufe trotzdem weitermachen
-CONTINUE_ON_ERROR=false
+CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-false}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -40,11 +47,24 @@ CONTINUE_ON_ERROR=false
 # ════════════════════════════════════════════════════════════════════════════
 
 CONV_SIF="sdf_to_pdbqt.sif"
-CONV_LIB_DIR="LIB"             # Eingangs-SDFs
+CONV_LIB_DIR="LIB"             # Eingangsdateien
+
+# Welche Formate aus LIB/ eingesammelt werden. SDF ist der Standardweg;
+# SMILES-Listen sind eine Alternative fuer Faelle, in denen keine SDF
+# vorliegt. PDB fehlt bewusst: das Format kennt keine Bindungsordnungen.
+#   sdf     nur *.sdf und *.sdf.gz
+#   smiles  nur *.smi, *.csv, *.tsv
+#   all     beides
+CONV_INPUT_TYPES="${CONV_INPUT_TYPES:-sdf}"
+
+# Spaltenzuordnung fuer SMILES-Listen. Leer = automatisch: Kopfzeile wird
+# ausgewertet, sonst .csv = Name,SMILES und .smi = SMILES Name.
+CONV_SMILES_COL=""
+CONV_NAME_COL=""
 CONV_OUT_DIR="data/PDBQT"      # muss [PATHS] pdbqt_dir aus docking.ini entsprechen
-CONV_WORKERS=15
-CONV_TIMEOUT=120               # Sekunden pro Molekuel
-CONV_UFF_ITERS=800
+CONV_WORKERS="${CONV_WORKERS:-15}"
+CONV_TIMEOUT="${CONV_TIMEOUT:-120}"               # Sekunden pro Molekuel
+CONV_UFF_ITERS="${CONV_UFF_ITERS:-800}"
 CONV_FLAT=false                # true = alle PDBQTs in einen Ordner
                                # false = Unterordner 0000/, 0001/ (empfohlen)
 
@@ -53,8 +73,16 @@ CONV_FLAT=false                # true = alle PDBQTs in einen Ordner
 # kollidiert, und die rekursive Ligandensuche im Docking findet sie trotzdem.
 CONV_SUBDIR_PER_SDF=true
 
-# Bereits vorhandene PDBQTs ueberspringen statt neu zu konvertieren
-CONV_SKIP_IF_EXISTS=true
+# Wiederaufnahme: bereits konvertierte Molekuele ueberspringen.
+# Der Konverter prueft das pro Molekuel anhand des Ziel-PDBQT, nicht pauschal
+# pro SDF. Ein abgebrochener Lauf wird damit genau dort fortgesetzt, wo er
+# stehengeblieben ist.
+CONV_RESUME=true
+
+# Nur ueberspringen wenn die SDF nachweislich VOLLSTAENDIG konvertiert ist,
+# also  konvertiert + fehlgeschlagen >= Molekuele im SDF.  false = immer
+# durchlaufen (der Konverter ueberspringt Fertiges dann selbst).
+CONV_SKIP_IF_COMPLETE=true
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -63,7 +91,7 @@ CONV_SKIP_IF_EXISTS=true
 
 DOCK_SIF="unidock-gpu.sif"
 DOCK_INI="config/docking.ini"
-DOCK_RESTART=false             # true = restart_orchestrator statt orchestrator
+DOCK_RESTART="${DOCK_RESTART:-false}"             # true = restart_orchestrator statt orchestrator
                                # (--restart auf der Kommandozeile setzt das auch)
 
 
@@ -215,18 +243,30 @@ if [ "$RUN_CONVERSION" = true ]; then
     require_file "$PROJECT_DIR/$CONV_SIF" "Container fuer Stufe 1" || exit 1
 
     shopt -s nullglob
-    SDF_FILES=("$PROJECT_DIR/$CONV_LIB_DIR"/*.sdf)
+    SDF_FILES=()
+    case "$CONV_INPUT_TYPES" in
+        sdf|all)
+            SDF_FILES+=("$PROJECT_DIR/$CONV_LIB_DIR"/*.sdf
+                        "$PROJECT_DIR/$CONV_LIB_DIR"/*.sdf.gz) ;;
+    esac
+    case "$CONV_INPUT_TYPES" in
+        smiles|all)
+            SDF_FILES+=("$PROJECT_DIR/$CONV_LIB_DIR"/*.smi
+                        "$PROJECT_DIR/$CONV_LIB_DIR"/*.csv
+                        "$PROJECT_DIR/$CONV_LIB_DIR"/*.tsv) ;;
+    esac
     shopt -u nullglob
 
     if [ ${#SDF_FILES[@]} -eq 0 ]; then
-        err "Keine .sdf-Dateien in $PROJECT_DIR/$CONV_LIB_DIR"
+        err "Keine Eingabedateien ($CONV_INPUT_TYPES) in $PROJECT_DIR/$CONV_LIB_DIR"
         RC=1
     else
         say "${#SDF_FILES[@]} SDF-Datei(en) gefunden"
         mkdir -p "$PROJECT_DIR/$CONV_OUT_DIR"
 
         for sdf in "${SDF_FILES[@]}"; do
-            stem="$(basename "$sdf" .sdf)"
+            base="$(basename "$sdf")"
+            stem="${base%.gz}"; stem="${stem%.*}"
 
             if [ "$CONV_SUBDIR_PER_SDF" = true ] && [ ${#SDF_FILES[@]} -gt 1 ]; then
                 out_sub="$CONV_OUT_DIR/$stem"
@@ -235,23 +275,47 @@ if [ "$RUN_CONVERSION" = true ]; then
             fi
             mkdir -p "$PROJECT_DIR/$out_sub"
 
-            existing=$(find "$PROJECT_DIR/$out_sub" -name '*.pdbqt' 2>/dev/null | head -1)
-            if [ "$CONV_SKIP_IF_EXISTS" = true ] && [ -n "$existing" ]; then
-                warn "$stem: PDBQTs vorhanden – uebersprungen (CONV_SKIP_IF_EXISTS=true)"
+            # ── Bilanz: wieviel ist von dieser SDF schon erledigt? ──
+            n_done=$(find "$PROJECT_DIR/$out_sub" -name '*.pdbqt' -type f 2>/dev/null | wc -l)
+            n_fail=$(find "$LOG_DIR" -name '*_convert_error.log' -type f 2>/dev/null | wc -l)
+            # "$$$$" trennt Molekuele im SDF; bei .gz entsprechend dekomprimiert
+            case "$base" in
+                *.sdf.gz) n_total=$(zgrep -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+                *.sdf)    n_total=$(grep  -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+                # SMILES-Liste: nichtleere Zeilen ohne Kommentare; eine
+                # eventuelle Kopfzeile zaehlt mit, die Bilanz ist also um
+                # hoechstens eins zu hoch.
+                *.gz)     n_total=$(zgrep -cvE '^\s*(#|$)' "$sdf" 2>/dev/null || echo 0) ;;
+                *)        n_total=$(grep  -cvE '^\s*(#|$)' "$sdf" 2>/dev/null || echo 0) ;;
+            esac
+            n_handled=$(( n_done + n_fail ))
+
+            say "$stem: $n_total Molekuele | $n_done konvertiert | $n_fail fehlgeschlagen | $(( n_total - n_handled )) offen"
+
+            if [ "$CONV_SKIP_IF_COMPLETE" = true ] && [ "$n_total" -gt 0 ] \
+               && [ "$n_handled" -ge "$n_total" ]; then
+                warn "$stem: vollstaendig – uebersprungen"
                 continue
             fi
 
-            say "Konvertiere $stem → $out_sub"
+            if [ "$n_done" -gt 0 ]; then
+                say "Setze $stem fort → $out_sub"
+            else
+                say "Konvertiere $stem → $out_sub"
+            fi
 
             CONV_ARGS=(
-                --sdf-file "/data/sdf/$(basename "$sdf")"
+                --input    "/data/sdf/$base"
                 --out-dir  "/data/pdbqt"
                 --log-dir  "/data/log"
                 --workers  "$CONV_WORKERS"
                 --timeout  "$CONV_TIMEOUT"
                 --uff-iters "$CONV_UFF_ITERS"
             )
-            [ "$CONV_FLAT" = true ] && CONV_ARGS+=(--flat)
+            [ "$CONV_FLAT" = true ]   && CONV_ARGS+=(--flat)
+            [ "$CONV_RESUME" = true ] && CONV_ARGS+=(--skip-existing)
+            [ -n "$CONV_SMILES_COL" ] && CONV_ARGS+=(--smiles-col "$CONV_SMILES_COL")
+            [ -n "$CONV_NAME_COL" ]   && CONV_ARGS+=(--name-col   "$CONV_NAME_COL")
 
             run apptainer run \
                 --bind "$PROJECT_DIR/$CONV_LIB_DIR:/data/sdf" \

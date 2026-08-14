@@ -31,7 +31,7 @@ Rescoring im Orchestrator:
 
 Integration in die Pipeline
 ----------------------------
-1. worker_gpu.py:  Nach dem Rescoring refine_target() aufrufen
+1. worker_rescore.py: Nach dem Rescoring refine_target() aufrufen
 2. orchestrator.py: run_refinement() analog zu run_rescoring() einfuegen
 3. docking_pipeline.py: Nach rescore_target() das Refinement einfuegen
 

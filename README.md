@@ -96,17 +96,55 @@ Build the three containers:
 ```bash
 cd build/
 
+# Stage 1
 cp ../src/sdf_to_pdbqt.py .
 apptainer build ../sdf_to_pdbqt.sif sdf_to_pdbqt.def
 
+# Stage 2
 cp ../src/{pipeline_common.py,docking_config.py,unidock_engine.py} .
 cp ../src/{worker_dock.py,worker_restart_dock.py} .
 apptainer build ../unidock-gpu.sif unidock-gpu.def
 
+# Stage 3 — gnina must already be in build/
 cp ../src/{worker_rescore.py,docking_rescore.py,gnina_refinement.py} .
-cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py} .
+cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py,ecr.py} .
 apptainer build ../rescoring-gpu.sif rescoring-gpu.def
 ```
+
+Apptainer resolves `%files` relative to the working directory, so the modules
+have to be copied into `build/` before each build. Rather than tracking that by
+hand, check it:
+
+```bash
+cd build/
+for d in sdf_to_pdbqt.def unidock-gpu.def rescoring-gpu.def; do
+  echo "--- $d"
+  sed -n '/^%files/,/^%[a-z]/p' "$d" | grep -oE '^\s+\S+' | tr -d ' ' | \
+  while read -r f; do [ -e "$f" ] && echo "  ok    $f" || echo "  FEHLT $f"; done
+done
+```
+
+Every entry has to resolve before you start a build. A missing file aborts the
+build after the base image has already been pulled, which on a slow connection
+costs more time than the check.
+
+### Rebuilding after changes
+
+Only the container whose modules changed needs rebuilding. `--force` overwrites
+the existing image:
+
+| Changed | Rebuild |
+|---|---|
+| `sdf_to_pdbqt.py` | `sdf_to_pdbqt.sif` |
+| `pipeline_common.py`, `docking_config.py`, `unidock_engine.py`, `worker_dock.py`, `worker_restart_dock.py` | `unidock-gpu.sif` |
+| `docking_rescore.py`, `ecr.py`, `worker_rescore.py`, `gnina_refinement.py`, `gnina_gpu_worker.py`, `linf9xgb_scorer.py` | `rescoring-gpu.sif` |
+| `orchestrator.py`, `restart_orchestrator.py`, `pipeline_start.sh`, `check_*.py`, `rescore_rank.py` | nothing — these run on the host |
+
+For iterating on a module you can skip the rebuild entirely: the orchestrators
+bind-mount `src/` into the containers at run time, so an edited file takes
+effect on the next run. The rebuild is what makes the change permanent in the
+image, which matters for reproducibility and for anyone who clones the
+repository.
 
 Verify that the Uni-Dock build supports your GPU architecture before anything
 else:
@@ -188,14 +226,18 @@ back to the value shown, except where marked required.
 | `CHECK_LIGANDS` | `true` | Run `check_ligands.py` between stage 1 and 2 |
 | `CONTINUE_ON_ERROR` | `false` | Continue after a failed stage instead of aborting |
 | `CONV_SIF` | `sdf_to_pdbqt.sif` | Stage 1 container |
-| `CONV_LIB_DIR` | `LIB` | Directory scanned for `*.sdf` |
+| `CONV_LIB_DIR` | `LIB` | Directory scanned for input files |
+| `CONV_INPUT_TYPES` | `sdf` | `sdf`, `smiles`, or `all`. Which file types are collected from `LIB/` |
+| `CONV_SMILES_COL` | *(empty)* | SMILES column, header name or 0-based index. Empty means autodetect |
+| `CONV_NAME_COL` | *(empty)* | Name column, same convention |
 | `CONV_OUT_DIR` | `data/PDBQT` | PDBQT output. Must match `[PATHS] pdbqt_dir` |
 | `CONV_WORKERS` | `15` | Parallel conversion processes |
 | `CONV_TIMEOUT` | `120` | Seconds per molecule before SIGALRM |
 | `CONV_UFF_ITERS` | `800` | UFF optimisation steps per molecule |
 | `CONV_FLAT` | `false` | `true` writes all PDBQTs into one directory |
 | `CONV_SUBDIR_PER_SDF` | `true` | One output subdirectory per input SDF |
-| `CONV_SKIP_IF_EXISTS` | `true` | Skip an SDF if its output directory already holds PDBQTs |
+| `CONV_RESUME` | `true` | Pass `--skip-existing` to the converter: molecules whose PDBQT already exists are skipped individually |
+| `CONV_SKIP_IF_COMPLETE` | `true` | Skip an SDF entirely once converted + failed ≥ molecules in the file |
 | `DOCK_SIF` | `unidock-gpu.sif` | Stage 2 container |
 | `DOCK_INI` | `config/docking.ini` | Stage 2 configuration |
 | `DOCK_RESTART` | `false` | Use `restart_orchestrator.py`; also set by `--restart` |
@@ -302,6 +344,7 @@ active functions. Otherwise weights normalise to 1 over the active set.
 | `gnina_use_gpu` | `true` | `false` forces `--no_gpu` |
 | `n_jobs` | `1` | joblib workers for the CLI path. `-1` uses all cores |
 | `rescore_batch_size` | `0` | Poses per GPU batch. `0` derives it from available VRAM |
+| `rescore_block_size` | `0` | Ligands per resumable block. `0` disables blocking. See below |
 | `cluster_poses` | `false` | RMSD clustering before scoring, reduces the number of poses |
 | `cluster_rmsd_cutoff` | `2.0` | Ångström threshold for clustering |
 | `deltalinf9xgb_n_workers` | `1` | Scoring workers for ΔLin_F9XGB |
@@ -507,14 +550,50 @@ This section will be updated once those numbers exist.
 ## Repository layout
 
 ```
-├── pipeline_start.sh          Stage toggles and orchestration
-├── config/                    docking.ini, rescore.ini
-├── src/                       All Python modules (single source of truth)
-├── build/                     Container definitions and build inputs
-├── LIB/                       Input SDF libraries (not tracked)
+├── pipeline_start.sh          Stage toggles, runs the three stages
+├── benchmark.sh               Throughput measurements (GPU scaling, batch sweep)
+│
+├── config/
+│   ├── docking.ini            Stage 2
+│   └── rescore.ini            Stage 3
+│
+├── src/
+│   ├── pipeline_common.py     Target parsing, ligand discovery, logging
+│   ├── ecr.py                 Consensus ranking, standard library only
+│   │
+│   ├── sdf_to_pdbqt.py        Stage 1
+│   │
+│   ├── docking_config.py      Stage 2 config
+│   ├── unidock_engine.py      Batched Uni-Dock calls
+│   ├── worker_dock.py         Stage 2 worker (in-container)
+│   ├── worker_restart_dock.py Stage 2 worker, restart mode
+│   ├── orchestrator.py        Chunk dispatch across GPUs (host)
+│   ├── restart_orchestrator.py
+│   │
+│   ├── worker_rescore.py      Stage 3 worker (in-container)
+│   ├── docking_rescore.py     Scoring and consensus
+│   ├── gnina_refinement.py    Refinement of top-ranked ligands
+│   ├── gnina_gpu_worker.py    gninatorch GPU backend
+│   ├── linf9xgb_scorer.py     ΔLin_F9XGB backend
+│   │
+│   ├── check_config.py        Pre-flight: INI consistency
+│   ├── check_ligands.py       Pre-flight: library layout and name collisions
+│   └── rescore_rank.py        Re-rank from stored scores, no container needed
+│
+├── build/
+│   ├── *.def                  Container definitions
+│   ├── gnina                  Binary, download separately (not tracked)
+│   ├── featureSASA.py         Patched third-party source
+│   └── prepare_betaAtoms.py   Patched third-party source
+│
+├── docs/
+│   ├── pipeline.svg           Diagram used in this README (plus dark variant)
+│   ├── make_diagram.py        Regenerates all diagram files
+│   └── *.md                   German operating notes
+├── LIB/                       Input libraries (not tracked)
 ├── TARGET/                    Receptor PDBQTs and config.txt
 ├── data/                      Intermediate PDBQTs and logs (not tracked)
-└── RESULTS/                   Poses, docking CSVs, rescoring output (not tracked)
+└── RESULTS/                   Poses, CSVs, rescoring output (not tracked)
 ```
 
 `src/` is bind-mounted into the containers at runtime as well as baked in at

@@ -34,7 +34,7 @@ From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 #
 # Start (ueber Orchestrator):
 #   apptainer exec --nv rescoring-gpu.sif /entrypoint.sh \
-#     python /app/worker_gpu.py
+#     python /app/worker_rescore.py
 # ============================================================
 
 %labels
@@ -57,6 +57,7 @@ From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 %files
     gnina                    /usr/local/bin/gnina
     worker_rescore.py        /app/worker_rescore.py
+    ecr.py                   /app/ecr.py
     docking_rescore.py       /app/docking_rescore.py
     gnina_refinement.py      /app/gnina_refinement.py
     gnina_gpu_worker.py      /app/gnina_gpu_worker.py
@@ -129,10 +130,18 @@ From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
         exit 1
     }
 
-    conda install -n ${ENV_NAME} -y -q \
-        -c conda-forge --override-channels \
-        joblib pandas
-    conda clean -afy
+    # Bewusst NICHTS Numerisches per conda in dieses Env:
+    #
+    # 'conda install pandas' zog numpy 2.4.6 und pandas 3.0.5 herein, beide
+    # gegen die NumPy-2-ABI gebaut. Weiter unten muss numpy aber wegen
+    # molgrid auf <2 heruntergestuft werden – das ergibt eine kaputte
+    # pandas-Installation, die erst zur Laufzeit auffaellt.
+    #
+    # pandas wird in diesem Env ohnehin nicht gebraucht: es benutzen nur
+    # featureSASA.py und prepare_betaAtoms.py, und die laufen im
+    # linf9xgb_env (dort pandas=1.3.0, passend zu Python 3.7).
+    # docking_rescore.py braucht aus diesem Bereich nur joblib und numpy,
+    # beide kommen unten per pip mit konsistenter numpy-Version.
 
     # ── PyTorch (CUDA 12.4) ───────────────────────────────
     # ALLES per pip: kein conda-numpy, kein MKL-Konflikt.
@@ -142,9 +151,23 @@ From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
     RESCORE_PIP=/opt/miniconda3/envs/${ENV_NAME}/bin/pip
     RESCORE_PY=/opt/miniconda3/envs/${ENV_NAME}/bin/python
 
+    # ── PyTorch ───────────────────────────────────────────
+    # Zwei Punkte, die hier vorher zum Build-Abbruch gefuehrt haben:
+    #
+    # 1. --index-url ERSETZT PyPI, --extra-index-url ERGAENZT es.
+    #    Der PyTorch-Index liefert torch und die meisten nvidia-*-Wheels,
+    #    aber nicht nvidia-cudnn-cu12. Mit --index-url war PyPI ausgesperrt
+    #    und pip meldete "no matching distributions available".
+    #
+    # 2. Ohne feste Version arbeitet sich pip beim Aufloesen rueckwaerts
+    #    durch die Kandidaten und laedt dabei jedes Mal ein ~800-900 MB
+    #    Wheel herunter, bevor es die naechste Version probiert. Im
+    #    fehlgeschlagenen Lauf waren das ueber 4 GB fuer nichts.
+    #    Feste Versionen sind hier ohnehin richtig: der Container soll
+    #    reproduzierbar sein, nicht "irgendein aktuelles torch".
     ${RESCORE_PIP} install --no-cache-dir \
-        torch torchvision \
-        --index-url https://download.pytorch.org/whl/cu124
+        torch==2.6.0+cu124 torchvision==0.21.0+cu124 \
+        --extra-index-url https://download.pytorch.org/whl/cu124
     ${RESCORE_PIP} install --no-cache-dir nvidia-cusparselt-cu12
     echo "/opt/miniconda3/envs/${ENV_NAME}/lib/python3.11/site-packages/nvidia/cusparselt/lib" \
         > /etc/ld.so.conf.d/nvidia-cusparselt.conf
@@ -152,10 +175,10 @@ From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
     # ── gninatorch + molgrid ──────────────────────────────
     ${RESCORE_PIP} install --no-cache-dir gninatorch
-    # molgrid erfordert numpy<2 → pip's numpy downgraden
-    # Kein MKL-Konflikt hier: conda hat kein eigenes numpy installiert,
-    # alles kommt von pip (torch → numpy) → konsistentes Backend.
-    ${RESCORE_PIP} install --no-cache-dir 'numpy>=1.26,<2'
+    # molgrid erfordert numpy<2. numpy und joblib zusammen in EINEM
+    # pip-Aufruf, damit pip eine konsistente Loesung waehlt statt
+    # nacheinander gegensaetzliche Constraints anzuwenden.
+    ${RESCORE_PIP} install --no-cache-dir 'numpy>=1.26,<2' joblib
 
     # ── gnina CLI (Fallback) ──────────────────────────────
     chmod +x /usr/local/bin/gnina
@@ -404,6 +427,11 @@ if torch.cuda.is_available():
 
 import numpy as np
 print(f'OK numpy {np.__version__}')
+assert np.__version__.startswith('1.'), \
+    f'numpy {np.__version__} – molgrid braucht <2, der Pin hat nicht gegriffen'
+
+from joblib import Parallel, delayed
+print('OK joblib')
 
 from gninatorch.gnina import setup_gnina_model
 print('OK gninatorch')

@@ -41,6 +41,7 @@ from docking_rescore import (
     _setup_logger,
     log_top10_ecr,
     rescore_target,
+    rescore_target_blocked,
 )
 
 WORKER_TARGET = os.environ.get("WORKER_TARGET", "")
@@ -124,12 +125,23 @@ def main() -> None:
             continue
 
         try:
-            results = rescore_target(
-                target=target,
-                target_results_dir=target_results_dir,
-                rescore_cfg=cfg,
-                logger=logger,
-            )
+            # Blockmodus, wenn rescore_block_size > 0: scort in Bloecken und
+            # sichert nach jedem einen Zwischenstand. Nur so ueberlebt ein
+            # Target den Abbruch an der Walltime, ohne von vorn zu beginnen.
+            if cfg.rescore_block_size > 0:
+                results = rescore_target_blocked(
+                    target=target,
+                    target_results_dir=target_results_dir,
+                    rescore_cfg=cfg,
+                    logger=logger,
+                )
+            else:
+                results = rescore_target(
+                    target=target,
+                    target_results_dir=target_results_dir,
+                    rescore_cfg=cfg,
+                    logger=logger,
+                )
             log_top10_ecr(results, target.name, logger)
         except Exception as exc:                   # noqa: BLE001
             logger.error("  Rescoring '%s' fehlgeschlagen: %s",

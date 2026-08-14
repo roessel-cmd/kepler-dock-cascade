@@ -223,7 +223,7 @@ def _run_rescore_worker(gpu,sif,project_dir,ini_path,target_name,results):
          "--env",f"WORKER_GPU_ID={idx}"]
     for pyfile in ["worker_rescore.py","docking_rescore.py",
                     "gnina_gpu_worker.py",
-                    "gnina_refinement.py","linf9xgb_scorer.py"]:
+                    "gnina_refinement.py","linf9xgb_scorer.py","ecr.py"]:
         local=project_dir/"src"/pyfile
         if local.exists(): cmd+=["--bind",f"{local}:/app/{pyfile}"]
     cmd+=[str(sif),"bash","-c",

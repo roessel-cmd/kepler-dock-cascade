@@ -98,6 +98,8 @@ from pathlib import Path
 from typing import Optional
 
 from joblib import Parallel, delayed
+
+import ecr as ecr_mod
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -184,6 +186,9 @@ class RescoringConfig:
     cluster_poses:       bool  = False  # Pose-Clustering vor Rescoring
     cluster_rmsd_cutoff: float = 2.0    # RMSD-Schwelle in Angstrom
     rescore_batch_size:  int   = 0      # 0 = auto (VRAM-basiert)
+    # Blockgroesse fuer wiederaufnahmefaehiges Rescoring.
+    # 0 = aus: alles in einem Durchgang wie bisher, kein Zwischenstand.
+    rescore_block_size:  int   = 0
     # Dense-Ensemble (zweites CNN-Modell)
     dense_enabled:       bool  = False
     dense_model:         str   = 'dense_ensemble'
@@ -225,6 +230,7 @@ class RescoringConfig:
             cluster_poses       = p.getboolean(s, "cluster_poses",       fallback=False),
             cluster_rmsd_cutoff = p.getfloat(  s, "cluster_rmsd_cutoff", fallback=2.0),
             rescore_batch_size  = p.getint(    s, "rescore_batch_size",  fallback=0),
+            rescore_block_size  = p.getint(    s, "rescore_block_size",  fallback=0),
             dense_enabled       = p.getboolean(s, "dense_enabled",       fallback=False),
             dense_model         = p.get(       s, "dense_model",         fallback="dense_ensemble"),
             w_vina        = p.getfloat(s, "w_vina",        fallback=0.0),
@@ -1052,69 +1058,14 @@ def _compute_ecr(
     weights:        Optional[dict[str, float]] = None,
 ) -> list[PoseResult]:
     """
-    Berechnet Exponential Consensus Ranking auf Pose-Ebene.
+    Duenner Wrapper um ecr.compute_ecr().
 
-    Algorithmus (Palacio-Rodriguez et al. 2019):
-    --------------------------------------------
-    Alle Scores sind bereits richtungskorrigiert (kleiner = besser).
-
-    Fuer jede aktive Scoring-Funktion j:
-      1. Posen mit gueltigem Score aufsteigend sortieren → Rang 1 = kleinster Wert
-      2. Posen ohne Score erhalten keinen ECR-Beitrag von j.
-      3. sigma = N_gesamt / sigma_fraction
-      4. ecr_j(pose) = exp( -rang_j / sigma )
-
-    ECR-Gesamtscore (gewichtet):
-      ecr_total = Summe_j  w_j * ecr_j
-      mit w_j aus weights-Dict (normiert, Summe=1).
-      Wenn weights=None: gleichgewichtet (w_j = 1/K).
+    Die eigentliche Rechnung liegt in ecr.py, damit sie ohne numpy, joblib
+    und PyTorch auskommt und auch auf dem Host laufen kann (rescore_rank.py
+    rankt damit ohne Container neu). Die Signatur bleibt unveraendert,
+    bestehende Aufrufe funktionieren weiter.
     """
-    N = len(poses)
-    if N == 0:
-        return poses
-
-    sigma = max(N / sigma_fraction, 1.0)
-
-    FIELDS = {
-        "vina":              ("score_vina",              "rank_vina",              "ecr_vina"),
-        "vinardo":           ("score_vinardo",           "rank_vinardo",           "ecr_vinardo"),
-        "ad4":               ("score_ad4",               "rank_ad4",               "ecr_ad4"),
-        "cnnaffinity":       ("score_cnnaffinity",       "rank_cnnaffinity",       "ecr_cnnaffinity"),
-        "cnnscore":          ("score_cnnscore",          "rank_cnnscore",          "ecr_cnnscore"),
-        "deltalinf9xgb":     ("score_deltalinf9xgb",     "rank_deltalinf9xgb",     "ecr_deltalinf9xgb"),
-        "dense_cnnaffinity": ("score_dense_cnnaffinity", "rank_dense_cnnaffinity", "ecr_dense_cnnaffinity"),
-        "dense_cnnscore":    ("score_dense_cnnscore",    "rank_dense_cnnscore",    "ecr_dense_cnnscore"),
-    }
-
-    # Default: gleichgewichtet
-    if weights is None:
-        weights = {k: 1.0 / len(active_scores) for k in active_scores}
-
-    for key in active_scores:
-        if key not in FIELDS:
-            continue
-        s_attr, r_attr, e_attr = FIELDS[key]
-
-        valid = sorted(
-            [(i, getattr(p, s_attr))
-             for i, p in enumerate(poses)
-             if getattr(p, s_attr) is not None],
-            key=lambda x: x[1],   # kleiner = besser → Rang 1
-        )
-        for rank0, (idx, _) in enumerate(valid):
-            rank = rank0 + 1
-            setattr(poses[idx], r_attr, rank)
-            setattr(poses[idx], e_attr, math.exp(-rank / sigma))
-
-    for pose in poses:
-        total = sum(
-            weights.get(k, 0.0) * getattr(pose, FIELDS[k][2])
-            for k in active_scores
-            if k in FIELDS
-        )
-        pose.ecr_total = total
-
-    return poses
+    return ecr_mod.compute_ecr(poses, sigma_fraction, active_scores, weights)
 
 
 # ======================================================================
@@ -1732,11 +1683,89 @@ def _score_target_with_deltalinf9xgb(
 # HAUPTFUNKTION: rescore_target()
 # ======================================================================
 
+# ======================================================================
+# RANKING + AUSGABE (aus rescore_target herausgeloest)
+# ======================================================================
+
+def _rank_and_write(
+    all_poses:          list[PoseResult],
+    active:             list[str],
+    target,
+    target_results_dir: Path,
+    rescore_cfg:        RescoringConfig,
+    logger:             logging.Logger,
+) -> list[LigandResult]:
+    """
+    Zweite Haelfte des Rescorings: ECR ueber ALLE Posen, Aggregation,
+    CSV-Ausgabe.
+
+    Herausgeloest, weil sie im Blockmodus erst laufen darf, wenn saemtliche
+    Bloecke gescort sind – die Raenge werden ueber den gesamten Posensatz
+    gebildet, ein blockweises Ranking waere ein anderes Verfahren.
+    Ausserdem ist dieser Teil billig und rein rechnerisch, laesst sich also
+    beliebig oft mit anderen Gewichten wiederholen (rescore_rank.py).
+    """
+    # --- Nur Scores in ECR einbeziehen fuer die Daten vorhanden sind ---
+    ATTR_MAP = {
+        "vina":              "score_vina",
+        "vinardo":           "score_vinardo",
+        "ad4":               "score_ad4",
+        "cnnaffinity":       "score_cnnaffinity",
+        "cnnscore":          "score_cnnscore",
+        "deltalinf9xgb":     "score_deltalinf9xgb",
+        "dense_cnnaffinity": "score_dense_cnnaffinity",
+        "dense_cnnscore":    "score_dense_cnnscore",
+    }
+    scores_with_data = [
+        sc for sc in active
+        if any(getattr(p, ATTR_MAP[sc]) is not None for p in all_poses)
+    ]
+
+    excluded = set(active) - set(scores_with_data)
+    if excluded:
+        logger.warning(
+            "  [%s] Folgende Scores haben keine Daten und werden vom "
+            "ECR ausgeschlossen: %s",
+            target.name, ", ".join(sorted(excluded)),
+        )
+
+    if not scores_with_data:
+        logger.error("  [%s] Keine Score-Daten fuer ECR vorhanden – Abbruch.",
+                     target.name)
+        return []
+
+    sigma = len(all_poses) / rescore_cfg.sigma_fraction
+    ecr_weights = rescore_cfg.get_ecr_weights(scores_with_data)
+    w_str = ", ".join(f"{k}={v:.2f}" for k, v in ecr_weights.items())
+    logger.info(
+        "  [%s] ECR: %d Posen | %d Scores (%s) | sigma = %.2f | weights: %s",
+        target.name, len(all_poses), len(scores_with_data),
+        ", ".join(scores_with_data), sigma, w_str,
+    )
+
+    # --- ECR berechnen ---
+    all_poses = _compute_ecr(all_poses, rescore_cfg.sigma_fraction,
+                             scores_with_data, ecr_weights)
+
+    # --- Aggregation ---
+    ligand_results = _aggregate_ligands(all_poses)
+
+    # --- CSVs schreiben ---
+    pose_csv   = _write_pose_csv(all_poses, target_results_dir, target.name)
+    ligand_csv = _write_ligand_csv(ligand_results, target_results_dir, target.name)
+    logger.info("  [%s] Pose-CSV:   %s", target.name, pose_csv.name)
+    logger.info("  [%s] Ligand-CSV: %s", target.name, ligand_csv.name)
+
+    return ligand_results
+
+
 def rescore_target(
     target:             "_TargetInfo | object",
     target_results_dir: Path,
     rescore_cfg:        RescoringConfig,
     logger:             logging.Logger,
+    files:              Optional[list[Path]] = None,
+    poses_only:         bool = False,
 ) -> list[LigandResult]:
     """
     Fuehrt das vollstaendige Rescoring fuer einen Target durch.
@@ -1752,7 +1781,10 @@ def rescore_target(
 
     Rueckgabe: LigandResult-Liste, absteigend nach ECR-Score.
     """
-    docked_files = sorted(target_results_dir.glob("*_docked.pdbqt"))
+    # files: explizite Dateiliste statt aller Posen des Targets. Wird vom
+    # Blockmodus benutzt, um einen Ausschnitt zu scoren.
+    docked_files = (sorted(files) if files is not None
+                    else sorted(target_results_dir.glob("*_docked.pdbqt")))
 
     if not docked_files:
         logger.warning(
@@ -2179,58 +2211,167 @@ def rescore_target(
                 target.name,
             )
 
-    # --- Nur Scores in ECR einbeziehen fuer die Daten vorhanden sind ---
-    ATTR_MAP = {
-        "vina":              "score_vina",
-        "vinardo":           "score_vinardo",
-        "ad4":               "score_ad4",
-        "cnnaffinity":       "score_cnnaffinity",
-        "cnnscore":          "score_cnnscore",
-        "deltalinf9xgb":     "score_deltalinf9xgb",
-        "dense_cnnaffinity": "score_dense_cnnaffinity",
-        "dense_cnnscore":    "score_dense_cnnscore",
-    }
-    scores_with_data = [
-        sc for sc in active
-        if any(getattr(p, ATTR_MAP[sc]) is not None for p in all_poses)
-    ]
+    # Blockmodus: nur die Rohscores zurueckgeben, Ranking macht der
+    # Aufrufer ueber alle Bloecke hinweg (siehe rescore_target_blocked).
+    if poses_only:
+        return all_poses
 
-    excluded = set(active) - set(scores_with_data)
-    if excluded:
-        logger.warning(
-            "  [%s] Folgende Scores haben keine Daten und werden vom "
-            "ECR ausgeschlossen: %s",
-            target.name, ", ".join(sorted(excluded)),
-        )
+    return _rank_and_write(all_poses, active, target, target_results_dir,
+                           rescore_cfg, logger)
 
-    if not scores_with_data:
-        logger.error("  [%s] Keine Score-Daten fuer ECR vorhanden – Abbruch.",
-                     target.name)
+
+
+
+# ======================================================================
+# BLOCKMODUS: SCORING IN TEILSCHRITTEN MIT ZWISCHENSTAENDEN
+# ======================================================================
+
+_PARTIAL_DIR  = ".rescore_partial"
+_PARTIAL_COLS = (["ligand", "pose"]
+                 + [ecr_mod.FIELDS[k][0] for k in ecr_mod.ALL_KEYS])
+
+
+def _partial_path(target_results_dir: Path, block_idx: int) -> Path:
+    return (target_results_dir / _PARTIAL_DIR
+            / f"scores_{block_idx:05d}.csv")
+
+
+def _write_partial(poses: list[PoseResult], path: Path) -> None:
+    """
+    Rohscores eines Blocks sichern – atomar ueber eine .tmp-Datei.
+
+    Ohne das Umbenennen koennte ein Abbruch mitten im Schreiben eine
+    halbe CSV hinterlassen, die beim naechsten Lauf als vollstaendig
+    gelesen wuerde. Geschrieben werden nur Ligand, Pose und die Rohscores:
+    Raenge und ECR-Terme haengen vom Gesamtsatz ab und werden ohnehin neu
+    berechnet.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=_PARTIAL_COLS)
+        w.writeheader()
+        for p in poses:
+            row = {"ligand": p.ligand, "pose": p.pose}
+            for key in ecr_mod.ALL_KEYS:
+                attr = ecr_mod.FIELDS[key][0]
+                val = getattr(p, attr, None)
+                row[attr] = "" if val is None else f"{val:.6f}"
+            w.writerow(row)
+    tmp.replace(path)
+
+
+def _read_partial(path: Path) -> list[PoseResult]:
+    """Liest einen gesicherten Block zurueck in PoseResult-Objekte."""
+    poses: list[PoseResult] = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            pr = PoseResult(ligand=row["ligand"], pose=int(row["pose"]))
+            for key in ecr_mod.ALL_KEYS:
+                attr = ecr_mod.FIELDS[key][0]
+                raw = (row.get(attr) or "").strip()
+                if raw:
+                    setattr(pr, attr, float(raw))
+            poses.append(pr)
+    return poses
+
+
+def rescore_target_blocked(
+    target:             "_TargetInfo | object",
+    target_results_dir: Path,
+    rescore_cfg:        RescoringConfig,
+    logger:             logging.Logger,
+) -> list[LigandResult]:
+    """
+    Rescoring in Bloecken mit Zwischenstaenden – wiederaufnahmefaehig.
+
+    Warum es das gibt: rescore_target() haelt alle Posen im Speicher und
+    schreibt erst am Ende. Ein an der Walltime abgebrochener Job verliert
+    damit die gesamte Arbeit des Targets. Hier wird die Ligandenliste in
+    Bloecke geschnitten, jeder Block komplett gescort und sofort gesichert.
+    Ein Neustart ueberspringt alles Gesicherte.
+
+    Das Ranking laeuft unveraendert ueber den GESAMTEN Posensatz, erst
+    nachdem alle Bloecke vorliegen – die ECR-Raenge sind global, ein
+    blockweises Ranking waere ein anderes Verfahren mit anderen Ergebnissen.
+
+    Preis: pro Block wird das gninatorch-Modell neu geladen und der
+    ΔLin_F9XGB-Worker-Pool neu gestartet. Bei Bloecken ab etwa 1000
+    Liganden faellt das nicht ins Gewicht, bei 100 schon.
+    """
+    all_files = sorted(target_results_dir.glob("*_docked.pdbqt"))
+    if not all_files:
+        logger.warning("  [%s] Keine Posen gefunden.", target.name)
         return []
 
-    sigma = len(all_poses) / rescore_cfg.sigma_fraction
-    ecr_weights = rescore_cfg.get_ecr_weights(scores_with_data)
-    w_str = ", ".join(f"{k}={v:.2f}" for k, v in ecr_weights.items())
+    size = max(1, rescore_cfg.rescore_block_size)
+    blocks = [all_files[i:i + size] for i in range(0, len(all_files), size)]
+
     logger.info(
-        "  [%s] ECR: %d Posen | %d Scores (%s) | sigma = %.2f | weights: %s",
-        target.name, len(all_poses), len(scores_with_data),
-        ", ".join(scores_with_data), sigma, w_str,
+        "  [%s] Blockmodus: %d Posen-Dateien in %d Bloecken à %d",
+        target.name, len(all_files), len(blocks), size,
     )
 
-    # --- ECR berechnen ---
-    all_poses = _compute_ecr(all_poses, rescore_cfg.sigma_fraction,
-                             scores_with_data, ecr_weights)
+    all_poses: list[PoseResult] = []
+    n_restored = 0
 
-    # --- Aggregation ---
-    ligand_results = _aggregate_ligands(all_poses)
+    for idx, block in enumerate(blocks):
+        part = _partial_path(target_results_dir, idx)
 
-    # --- CSVs schreiben ---
-    pose_csv   = _write_pose_csv(all_poses, target_results_dir, target.name)
-    ligand_csv = _write_ligand_csv(ligand_results, target_results_dir, target.name)
-    logger.info("  [%s] Pose-CSV:   %s", target.name, pose_csv.name)
-    logger.info("  [%s] Ligand-CSV: %s", target.name, ligand_csv.name)
+        if part.exists() and part.stat().st_size > 0:
+            try:
+                restored = _read_partial(part)
+                all_poses.extend(restored)
+                n_restored += 1
+                logger.info("  [%s] Block %d/%d: %d Posen aus %s uebernommen",
+                            target.name, idx + 1, len(blocks),
+                            len(restored), part.name)
+                continue
+            except (OSError, ValueError, KeyError) as exc:
+                logger.warning("  [%s] Block %d unlesbar (%s) – wird neu gescort.",
+                               target.name, idx + 1, exc)
 
-    return ligand_results
+        logger.info("  [%s] Block %d/%d: %d Liganden werden gescort",
+                    target.name, idx + 1, len(blocks), len(block))
+        poses = rescore_target(
+            target=target,
+            target_results_dir=target_results_dir,
+            rescore_cfg=rescore_cfg,
+            logger=logger,
+            files=block,
+            poses_only=True,
+        )
+        if not poses:
+            logger.warning("  [%s] Block %d lieferte keine Posen.",
+                           target.name, idx + 1)
+            continue
+
+        _write_partial(poses, part)
+        all_poses.extend(poses)
+        logger.info("  [%s] Block %d gesichert: %s (%d Posen)",
+                    target.name, idx + 1, part.name, len(poses))
+
+    if n_restored:
+        logger.info("  [%s] %d von %d Bloecken stammten aus einem frueheren Lauf.",
+                    target.name, n_restored, len(blocks))
+
+    if not all_poses:
+        logger.error("  [%s] Keine Posen – Rescoring leer.", target.name)
+        return []
+
+    # Aktive Scores wie im Einbahn-Pfad bestimmen
+    active: list[str] = []
+    if rescore_cfg.vina_enabled:          active.append("vina")
+    if rescore_cfg.vinardo_enabled:       active.append("vinardo")
+    if rescore_cfg.ad4_enabled:           active.append("ad4")
+    if rescore_cfg.cnnaffinity_enabled:   active.append("cnnaffinity")
+    if rescore_cfg.cnnscore_enabled:      active.append("cnnscore")
+    if rescore_cfg.deltalinf9xgb_enabled: active.append("deltalinf9xgb")
+    if rescore_cfg.dense_enabled:
+        active += ["dense_cnnaffinity", "dense_cnnscore"]
+
+    return _rank_and_write(all_poses, active, target, target_results_dir,
+                           rescore_cfg, logger)
 
 
 # ======================================================================

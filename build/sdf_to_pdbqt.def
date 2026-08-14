@@ -31,7 +31,14 @@ From: mambaorg/micromamba:1.5.8
     # Meeko via pip (PyPI ist aktueller als conda-forge)
     # gemmi ist seit neueren Meeko-Versionen Pflicht (wird ueber meeko.polymer importiert),
     # aber nicht automatisch als Dependency gezogen — daher explizit.
-    /opt/conda/bin/pip install --no-cache-dir gemmi "meeko>=0.6,<1.0"
+    # Meeko-Version fixieren, NICHT nur einen Bereich angeben.
+    # Zwischen 0.6 und 0.7 wurde MoleculePreparation umbenannt
+    # (macrocycle_opening -> rigid_macrocycles). sdf_to_pdbqt.py faengt
+    # beide ab, aber ein offener Bereich laesst zwei Builds desselben
+    # Definitionsfiles unterschiedliche Versionen ziehen – und damit
+    # unterschiedliche Ergebnisse. Fuer eine reproduzierbare Bibliothek
+    # ist das nicht hinnehmbar.
+    /opt/conda/bin/pip install --no-cache-dir gemmi "meeko==0.7.1"
 
     chmod 0755 /opt/sdf_to_pdbqt.py
 
