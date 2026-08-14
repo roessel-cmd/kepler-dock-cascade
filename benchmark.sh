@@ -9,6 +9,19 @@
 #
 #     ./benchmark.sh              # Matrix laut Konfiguration unten
 #     ./benchmark.sh --dry-run    # nur zeigen, was ausgefuehrt wuerde
+#
+# Matrix, Ausgabeverzeichnis und Messsatz lassen sich per Umgebungsvariable
+# ueberschreiben, ohne das Skript zu kopieren:
+#
+#     BENCH_RUNS="4:balance:250:250 4:balance:500:500" \
+#     BENCH_OUT=benchmark_batch BENCH_N_LIGANDS=60000 ./benchmark.sh
+#
+# WICHTIG bei einer zweiten Messreihe: BENCH_OUT aendern. Sonst
+# ueberschreibt sie summary.csv und die Logs der ersten.
+#
+# Voraussetzung: die Liganden liegen bereits als PDBQT vor (Stufe 1 ist
+# nicht Teil der Messung), und TARGET/config.txt enthaelt mindestens ein
+# Target mit vorhandenem Rezeptor-PDBQT.
 # ============================================================================
 
 set -uo pipefail
@@ -17,7 +30,18 @@ set -uo pipefail
 #  MESSMATRIX
 # ════════════════════════════════════════════════════════════════════════════
 # Ein Eintrag pro Lauf:  "<gpus>:<search_mode>:<batch_size>[:<chunk_size>]"
+# Reihenfolge ist die Ausfuehrungsreihenfolge.
+#
+# chunk_size ist optional. Ohne Angabe wird batch_size * 5 gesetzt, damit
+# jeder Chunk in genau fuenf gleich grosse Sub-Batches zerfaellt. Das ist
+# beim Batch-Sweep entscheidend: bei festem chunk_size=5000 ergaebe
+# batch_size=4000 die Aufteilung 4000+1000, und der 1000er-Rest laeuft bei
+# geringerer Sättigung. batch=4000 saehe dadurch schlechter aus als es ist.
 
+# Per Umgebungsvariable ueberschreibbar (Eintraege durch Leerzeichen getrennt)
+if [ -n "${BENCH_RUNS:-}" ]; then
+    read -r -a RUNS <<< "$BENCH_RUNS"
+else
 RUNS=(
     "1:fast:1000"
     "1:balance:1000"
@@ -28,7 +52,20 @@ RUNS=(
     "4:balance:1000"
     "4:detail:1000"
 )
+fi
 
+# ACHTUNG zur Laufzeit: 'detail' kostet ein Vielfaches von 'balance'. Der
+# 1-GPU-detail-Lauf ist damit der mit Abstand laengste der Matrix und
+# bestimmt, wie lange das Ganze dauert. Er ist trotzdem drin, weil ohne ihn
+# der Speedup fuer 4:detail keine Basis haette. Wenn die Zeit knapp ist:
+# diese eine Zeile streichen – 4:detail wird dann zu seiner eigenen Basis
+# und zeigt Speedup 1.00x, der Durchsatzwert bleibt aber gueltig.
+
+# ── Batch-Sweep ────────────────────────────────────────────────────────────
+# Die eigentliche Stellschraube fuer die SM-Auslastung: batch_size bestimmt,
+# wieviele Liganden Uni-Dock in einen gemeinsamen CUDA-Launch packt. Der
+# Standardwert 1000 ist gesetzt, nicht gemessen.
+#
 # Als EIGENE Messreihe fahren, nicht in dieselbe Matrix mischen: die
 # GPU-Skalierung beantwortet "wie gut verteilt der Orchestrator", der
 # Batch-Sweep "wie gut saettigt die Engine". Dazu oben RUNS auskommentieren
@@ -43,17 +80,31 @@ RUNS=(
 
 BENCH_SIF="unidock-gpu.sif"
 BENCH_INI_TEMPLATE="config/docking.ini"   # Basis; GPU/Modus/Batch werden ersetzt
-BENCH_OUT="benchmark"                     # Ergebnisverzeichnis (Logs + CSV)
+BENCH_OUT="${BENCH_OUT:-benchmark}"       # Ergebnisverzeichnis (Logs + CSV)
 
-BENCH_N_LIGANDS=20000
+# Ligandenmenge pro Lauf. 0 = alle aus pdbqt_dir verwenden.
+# Ein fester Ausschnitt macht die Laeufe vergleichbar UND kurz genug, dass
+# die ganze Matrix in vertretbarer Zeit durchlaeuft. Als Richtwert: bei
+# 47.000 Liganden/h auf einer Karte dauert ein 1-GPU-Lauf mit 20.000
+# Liganden gut 25 Minuten – ein detail-Lauf entsprechend laenger.
+#
+# Bevor du die ganze Matrix startest: einmal mit 2000 durchlaufen lassen.
+# Das dauert wenige Minuten und zeigt, ob Auswertung, GPU-Telemetrie und
+# CSV stimmen. Danach hochsetzen und die eigentliche Messung fahren.
+BENCH_N_LIGANDS="${BENCH_N_LIGANDS:-15000}"
 
-
-BENCH_WARMUP=true
+# Ein Aufwaermlauf vor der Messung. Der erste Lauf zahlt Page-Cache,
+# GPU-Initialisierung und Container-Start; ohne Aufwaermen sieht der
+# erste Matrixeintrag systematisch schlechter aus als er ist.
+BENCH_WARMUP="${BENCH_WARMUP:-true}"
 BENCH_WARMUP_LIGANDS=2000
 
 # Abtastintervall fuer nvidia-smi in Sekunden. 0 = keine GPU-Telemetrie.
 BENCH_SAMPLE_INTERVAL=5
-BENCH_SEED=42
+
+# Seed fuer reproduzierbare Laeufe. 0 = zufaellig (nicht empfohlen fuer
+# eine Messreihe, weil Sampling-Unterschiede in den Durchsatz eingehen).
+BENCH_SEED="${BENCH_SEED:-42}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
