@@ -76,7 +76,7 @@ call remains.
 - [Apptainer](https://apptainer.org/) ≥ 1.2
 - Python 3.10+ on the host (for the orchestrator and pre-flight checks)
 
-Verified on 4 × NVIDIA H100 (sm_90) @[MUSICA](https://docs.vsc.ac.at/systems/musica.html) ASC-Supercomputer
+Verified on 4 × NVIDIA H100 (sm_90).
 
 ---
 
@@ -127,24 +127,6 @@ done
 Every entry has to resolve before you start a build. A missing file aborts the
 build after the base image has already been pulled, which on a slow connection
 costs more time than the check.
-
-### Rebuilding after changes
-
-Only the container whose modules changed needs rebuilding. `--force` overwrites
-the existing image:
-
-| Changed | Rebuild |
-|---|---|
-| `sdf_to_pdbqt.py` | `sdf_to_pdbqt.sif` |
-| `pipeline_common.py`, `docking_config.py`, `unidock_engine.py`, `worker_dock.py`, `worker_restart_dock.py` | `unidock-gpu.sif` |
-| `docking_rescore.py`, `ecr.py`, `worker_rescore.py`, `gnina_refinement.py`, `gnina_gpu_worker.py`, `linf9xgb_scorer.py` | `rescoring-gpu.sif` |
-| `orchestrator.py`, `restart_orchestrator.py`, `pipeline_start.sh`, `check_*.py`, `rescore_rank.py` | nothing — these run on the host |
-
-For iterating on a module you can skip the rebuild entirely: the orchestrators
-bind-mount `src/` into the containers at run time, so an edited file takes
-effect on the next run. The rebuild is what makes the change permanent in the
-image, which matters for reproducibility and for anyone who clones the
-repository.
 
 Verify that the Uni-Dock build supports your GPU architecture before anything
 else:
@@ -366,6 +348,73 @@ active functions. Otherwise weights normalise to 1 over the active set.
 | `use_gpu` | `true` | GPU for the refinement runs |
 | `gnina_binary` | *(empty)* | Path to gnina, autodetected when empty |
 
+## Running on an HPC cluster
+
+Three Slurm job scripts, submitted from the project root:
+
+```bash
+sbatch convert.slurm      # stage 1, CPU only, once per library
+sbatch dock.slurm         # stage 2, chains itself past the wall-clock limit
+sbatch benchmark.slurm    # throughput measurements, single job
+```
+
+Adjust the `#SBATCH` headers to your site: partition names, core counts and
+wall-clock limits differ between clusters. All three abort with a clear message
+if submitted from anywhere but the project root, since Slurm runs a copy of the
+script from its spool directory and only `SLURM_SUBMIT_DIR` points back to the
+repository.
+
+### convert.slurm
+
+Runs stage 1 on a CPU partition. Conversion needs no GPU, and a job holding four
+H100s for hours of RDKit work wastes the scarce resource. Worker count is taken
+from `SLURM_CPUS_PER_TASK` rather than the default 15, minus one core for the
+producer that streams the SDF. `check_ligands.py` runs once at the end.
+
+Interrupted runs resume: resubmit and the converter skips molecules whose PDBQT
+already exists.
+
+### dock.slurm
+
+Runs stage 2 and **submits its successor before starting work**, with
+`--dependency=afterany`. That ordering matters: a resubmit at the end of the
+script is never reached when the job is killed at the wall-clock limit, which is
+the normal case for a long screen.
+
+`#SBATCH --signal=B:USR1@600` makes Slurm send `USR1` ten minutes before the
+limit. The handler terminates the process group so containers shut down in order
+instead of being killed mid-write. The sub-batch in flight is lost and re-docked
+by the next job — at most `batch_size` ligands.
+
+The chain stops when nothing is left, when a run made no progress and was not
+cut short by the wall clock, or after `CHAIN_MAX` links (default 20). The
+remaining work is derived from `RESULTS/<target>/*_docked.pdbqt`, the same
+measure the restart orchestrator uses, so the stop condition and the resume
+logic cannot disagree.
+
+Conversion and the ligand check are switched off inside the chain: they are
+one-off work, and re-scanning a million-file library at every link costs GPU
+time for nothing.
+
+```bash
+sbatch dock.slurm                          # default chain
+CHAIN_MAX=5 sbatch --export=ALL,CHAIN_MAX=5 dock.slurm   # shorter chain
+squeue -u $USER                            # see the pending successor
+scancel <job-id>                           # cancelling a link stops the chain
+```
+
+### benchmark.slurm
+
+Runs the benchmark matrix as a single job — deliberately without chaining, since
+a measurement split across two jobs may land on different hardware and is not
+comparable. Requires `--exclusive`: a shared node means measuring other people's
+load.
+
+Before the matrix it records the environment (CPU, GPUs, driver, topology,
+container timestamps, Uni-Dock version, git commit) to
+`logs/bench-<jobid>-environment.txt`, and verifies that Uni-Dock starts on the
+node. Without those details a throughput number is not interpretable.
+
 ### Target definition
 
 `TARGET/config.txt` is not an INI. One block per receptor, blocks separated by
@@ -552,6 +601,9 @@ This section will be updated once those numbers exist.
 ```
 ├── pipeline_start.sh          Stage toggles, runs the three stages
 ├── benchmark.sh               Throughput measurements (GPU scaling, batch sweep)
+├── convert.slurm              HPC: stage 1 on a CPU partition
+├── dock.slurm                 HPC: stage 2, self-chaining past the wall clock
+├── benchmark.slurm            HPC: benchmark matrix as one job
 │
 ├── config/
 │   ├── docking.ini            Stage 2
@@ -578,6 +630,7 @@ This section will be updated once those numbers exist.
 │   │
 │   ├── check_config.py        Pre-flight: INI consistency
 │   ├── check_ligands.py       Pre-flight: library layout and name collisions
+│   ├── pipeline_progress.py   Remaining docking work; stop condition for dock.slurm
 │   └── rescore_rank.py        Re-rank from stored scores, no container needed
 │
 ├── build/
