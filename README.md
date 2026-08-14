@@ -76,7 +76,7 @@ call remains.
 - [Apptainer](https://apptainer.org/) ≥ 1.2
 - Python 3.10+ on the host (for the orchestrator and pre-flight checks)
 
-Verified on 4 × NVIDIA H100 (sm_90).
+Verified on 4 × NVIDIA H100 (sm_90) @[MUSICA](https://docs.vsc.ac.at/systems/musica.html) ASC-Supercomputer
 
 ---
 
