@@ -23,16 +23,23 @@ set -uo pipefail
 #  SCHALTER
 # ════════════════════════════════════════════════════════════════════════════
 
-RUN_CONVERSION=true      # Stufe 1: SDF → PDBQT
-RUN_DOCKING=false         # Stufe 2: Uni-Dock
-RUN_RESCORING=false       # Stufe 3: Rescoring + Refinement
+# Jeder Schalter laesst sich per Umgebungsvariable ueberschreiben, ohne die
+# Datei zu aendern:
+#     RUN_CONVERSION=false RUN_RESCORING=false ./pipeline_start.sh
+# Genau das nutzt slurm_pipeline.sh, um in der Kette nur zu docken – die
+# Konvertierung ist eine einmalige CPU-Aufgabe und hat in einem Job mit
+# vier belegten GPUs nichts verloren.
+
+RUN_CONVERSION="${RUN_CONVERSION:-true}"    # Stufe 1: SDF → PDBQT
+RUN_DOCKING="${RUN_DOCKING:-true}"          # Stufe 2: Uni-Dock
+RUN_RESCORING="${RUN_RESCORING:-true}"      # Stufe 3: Rescoring + Refinement
 
 # Vorabpruefungen (schnell, verhindern stundenlange Fehllaeufe)
-CHECK_CONFIG=true        # docking.ini gegen rescore.ini pruefen
-CHECK_LIGANDS=true       # PDBQT-Bibliothek pruefen (Layout, Namenskollisionen)
+CHECK_CONFIG="${CHECK_CONFIG:-true}"        # docking.ini gegen rescore.ini
+CHECK_LIGANDS="${CHECK_LIGANDS:-true}"      # PDBQT-Bibliothek pruefen
 
 # Bei Fehler einer Stufe trotzdem weitermachen
-CONTINUE_ON_ERROR=false
+CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-false}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -48,16 +55,16 @@ CONV_LIB_DIR="LIB"             # Eingangsdateien
 #   sdf     nur *.sdf und *.sdf.gz
 #   smiles  nur *.smi, *.csv, *.tsv
 #   all     beides
-CONV_INPUT_TYPES="sdf"
+CONV_INPUT_TYPES="${CONV_INPUT_TYPES:-sdf}"
 
 # Spaltenzuordnung fuer SMILES-Listen. Leer = automatisch: Kopfzeile wird
 # ausgewertet, sonst .csv = Name,SMILES und .smi = SMILES Name.
 CONV_SMILES_COL=""
 CONV_NAME_COL=""
 CONV_OUT_DIR="data/PDBQT"      # muss [PATHS] pdbqt_dir aus docking.ini entsprechen
-CONV_WORKERS=15
-CONV_TIMEOUT=120               # Sekunden pro Molekuel
-CONV_UFF_ITERS=800
+CONV_WORKERS="${CONV_WORKERS:-15}"
+CONV_TIMEOUT="${CONV_TIMEOUT:-120}"               # Sekunden pro Molekuel
+CONV_UFF_ITERS="${CONV_UFF_ITERS:-800}"
 CONV_FLAT=false                # true = alle PDBQTs in einen Ordner
                                # false = Unterordner 0000/, 0001/ (empfohlen)
 
@@ -84,7 +91,7 @@ CONV_SKIP_IF_COMPLETE=true
 
 DOCK_SIF="unidock-gpu.sif"
 DOCK_INI="config/docking.ini"
-DOCK_RESTART=false             # true = restart_orchestrator statt orchestrator
+DOCK_RESTART="${DOCK_RESTART:-false}"             # true = restart_orchestrator statt orchestrator
                                # (--restart auf der Kommandozeile setzt das auch)
 
 
