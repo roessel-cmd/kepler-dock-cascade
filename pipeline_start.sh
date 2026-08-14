@@ -24,8 +24,8 @@ set -uo pipefail
 # ════════════════════════════════════════════════════════════════════════════
 
 RUN_CONVERSION=true      # Stufe 1: SDF → PDBQT
-RUN_DOCKING=true         # Stufe 2: Uni-Dock
-RUN_RESCORING=true       # Stufe 3: Rescoring + Refinement
+RUN_DOCKING=false         # Stufe 2: Uni-Dock
+RUN_RESCORING=false       # Stufe 3: Rescoring + Refinement
 
 # Vorabpruefungen (schnell, verhindern stundenlange Fehllaeufe)
 CHECK_CONFIG=true        # docking.ini gegen rescore.ini pruefen
@@ -53,8 +53,16 @@ CONV_FLAT=false                # true = alle PDBQTs in einen Ordner
 # kollidiert, und die rekursive Ligandensuche im Docking findet sie trotzdem.
 CONV_SUBDIR_PER_SDF=true
 
-# Bereits vorhandene PDBQTs ueberspringen statt neu zu konvertieren
-CONV_SKIP_IF_EXISTS=true
+# Wiederaufnahme: bereits konvertierte Molekuele ueberspringen.
+# Der Konverter prueft das pro Molekuel anhand des Ziel-PDBQT, nicht pauschal
+# pro SDF. Ein abgebrochener Lauf wird damit genau dort fortgesetzt, wo er
+# stehengeblieben ist.
+CONV_RESUME=true
+
+# Nur ueberspringen wenn die SDF nachweislich VOLLSTAENDIG konvertiert ist,
+# also  konvertiert + fehlgeschlagen >= Molekuele im SDF.  false = immer
+# durchlaufen (der Konverter ueberspringt Fertiges dann selbst).
+CONV_SKIP_IF_COMPLETE=true
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -235,13 +243,29 @@ if [ "$RUN_CONVERSION" = true ]; then
             fi
             mkdir -p "$PROJECT_DIR/$out_sub"
 
-            existing=$(find "$PROJECT_DIR/$out_sub" -name '*.pdbqt' 2>/dev/null | head -1)
-            if [ "$CONV_SKIP_IF_EXISTS" = true ] && [ -n "$existing" ]; then
-                warn "$stem: PDBQTs vorhanden – uebersprungen (CONV_SKIP_IF_EXISTS=true)"
+            # ── Bilanz: wieviel ist von dieser SDF schon erledigt? ──
+            n_done=$(find "$PROJECT_DIR/$out_sub" -name '*.pdbqt' -type f 2>/dev/null | wc -l)
+            n_fail=$(find "$LOG_DIR" -name '*_convert_error.log' -type f 2>/dev/null | wc -l)
+            # "$$$$" trennt Molekuele im SDF; bei .gz entsprechend dekomprimiert
+            case "$sdf" in
+                *.gz) n_total=$(zgrep -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+                *)    n_total=$(grep  -c '^\$\$\$\$' "$sdf" 2>/dev/null || echo 0) ;;
+            esac
+            n_handled=$(( n_done + n_fail ))
+
+            say "$stem: $n_total Molekuele | $n_done konvertiert | $n_fail fehlgeschlagen | $(( n_total - n_handled )) offen"
+
+            if [ "$CONV_SKIP_IF_COMPLETE" = true ] && [ "$n_total" -gt 0 ] \
+               && [ "$n_handled" -ge "$n_total" ]; then
+                warn "$stem: vollstaendig – uebersprungen"
                 continue
             fi
 
-            say "Konvertiere $stem → $out_sub"
+            if [ "$n_done" -gt 0 ]; then
+                say "Setze $stem fort → $out_sub"
+            else
+                say "Konvertiere $stem → $out_sub"
+            fi
 
             CONV_ARGS=(
                 --sdf-file "/data/sdf/$(basename "$sdf")"
@@ -251,7 +275,8 @@ if [ "$RUN_CONVERSION" = true ]; then
                 --timeout  "$CONV_TIMEOUT"
                 --uff-iters "$CONV_UFF_ITERS"
             )
-            [ "$CONV_FLAT" = true ] && CONV_ARGS+=(--flat)
+            [ "$CONV_FLAT" = true ]   && CONV_ARGS+=(--flat)
+            [ "$CONV_RESUME" = true ] && CONV_ARGS+=(--skip-existing)
 
             run apptainer run \
                 --bind "$PROJECT_DIR/$CONV_LIB_DIR:/data/sdf" \
