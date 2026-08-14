@@ -3,15 +3,6 @@ sdf_to_pdbqt.py
 ================
 Standalone-Konverter: Sammel-SDF → PDBQT direkt via RDKit + Meeko.
 
-Hintergrund
------------
-Der Umweg SDF → PDB → PDBQT verliert Bindungsordnungs-Informationen
-(PDB hat keine echten Bond-Records). Tools wie AutoDockTools rekonstruieren
-die Bindungen anschliessend rein geometrisch aus Atomabstaenden – was bei
-ungluecklichen Konformationen zu Fehlern fuehrt (z.B. 5 Bindungen wo nur
-4 sein sollten).
-
-Dieses Skript geht stattdessen direkt:
     SDF (gestreamt)  →  (RDKit: H-Add + ggf. ETKDG + UFF-Opt)  →  (Meeko: PDBQT)
 
 RDKit kennt aus dem SDF die Bindungsordnungen explizit, und Meeko schreibt
@@ -274,7 +265,10 @@ def worker_loop(worker_id: int,
 def producer_loop(sdf_file_str: str,
                   job_queue: mp.Queue,
                   num_workers: int,
-                  control_queue: mp.Queue) -> None:
+                  control_queue: mp.Queue,
+                  out_dir_str: str = "",
+                  flat: bool = False,
+                  skip_existing: bool = False) -> None:
     """
     Liest die Sammel-SDF zeilenweise und splittet an '$$$$'-Trennern.
     Sendet (index, mol_block, mol_name) in die job_queue.
@@ -286,7 +280,11 @@ def producer_loop(sdf_file_str: str,
     bleibt stabil.
     """
     sdf_path = Path(sdf_file_str)
-    sent = 0
+    out_dir  = Path(out_dir_str) if out_dir_str else None
+    sent     = 0     # Index im SDF – bestimmt den Unterordner, laeuft IMMER weiter
+    queued   = 0     # tatsaechlich in die Queue gelegt
+    skipped  = 0     # bereits vorhanden
+
     with open(sdf_path, "r", encoding="utf-8", errors="replace") as fh:
         block_lines: list[str] = []
         for raw_line in fh:
@@ -296,9 +294,27 @@ def producer_loop(sdf_file_str: str,
                 # SDF-Standard: Name ist die 1. Zeile des Blocks
                 first_line = block_lines[0].strip() if block_lines else ""
                 mol_name = safe_mol_name(first_line, sent)
+
+                # Wiederaufnahme: liegt das PDBQT schon, ueberspringen.
+                # Der Index sent laeuft trotzdem weiter, damit sich die
+                # Unterordner-Aufteilung nicht verschiebt – sonst landete
+                # dasselbe Molekuel beim naechsten Lauf woanders.
+                if skip_existing and out_dir is not None:
+                    out_path = make_output_path(out_dir, mol_name, sent, flat)
+                    if out_path.exists() and out_path.stat().st_size > 0:
+                        sent += 1
+                        skipped += 1
+                        block_lines = []
+                        continue
+
                 job_queue.put((sent, mol_block, mol_name))
                 sent += 1
+                queued += 1
                 block_lines = []
+
+    if skip_existing:
+        print(f"[Producer] {sent:,} Molekuele im SDF | {skipped:,} bereits "
+              f"konvertiert | {queued:,} zu erledigen", flush=True)
 
     # Sentinel pro Worker
     for _ in range(num_workers):
@@ -347,6 +363,10 @@ def parse_args() -> argparse.Namespace:
                     help="Pfad zur Sammel-SDF (kann viele Molekuele enthalten).")
     ap.add_argument("--out-dir",  required=True, type=Path,
                     help="Ausgabe-Verzeichnis fuer PDBQTs.")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Molekuele ueberspringen, deren PDBQT bereits "
+                         "vorhanden und nicht leer ist. Fuer die Wiederaufnahme "
+                         "eines abgebrochenen Laufs.")
     ap.add_argument("--log-dir",  required=True, type=Path,
                     help="Log-Verzeichnis (conversion.log + Per-Molekuel Errors).")
     ap.add_argument("--workers", type=int, default=15,
@@ -390,7 +410,8 @@ def main() -> int:
     # Producer starten
     producer = ctx.Process(
         target=producer_loop,
-        args=(str(args.sdf_file), job_queue, args.workers, control_queue),
+        args=(str(args.sdf_file), job_queue, args.workers, control_queue,
+              str(args.out_dir), args.flat, args.skip_existing),
         name="producer",
         daemon=True,
     )
@@ -488,4 +509,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
