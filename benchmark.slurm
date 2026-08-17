@@ -6,10 +6,12 @@
 #SBATCH --job-name=kdc-bench
 #SBATCH -N 1
 #SBATCH -p zen4_0768_h100x4
-#SBATCH --qos zen4_0768_h100x4
+#SBATCH --qos idle_zen4_0768_h100x4
 #SBATCH --gres=gpu:4
 #SBATCH --threads-per-core=1
 #SBATCH --time=08:00:00
+#SBATCH --mail-user=thomas.roessel@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=logs/bench-%j.out
 
 # Vier GPUs anfordern, auch fuer die 1- und 2-GPU-Laeufe: der Orchestrator
