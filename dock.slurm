@@ -7,10 +7,12 @@
 #SBATCH --job-name=kdc-dock
 #SBATCH -N 1
 #SBATCH -p zen4_0768_h100x4
-#SBATCH --qos zen4_0768_h100x4
+#SBATCH --qos idle_zen4_0768_h100x4
 #SBATCH --gres=gpu:4
 #SBATCH --threads-per-core=1
-#SBATCH --time=71:30:00
+#SBATCH --time=23:30:00
+#SBATCH --mail-user=thomas.roessel@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=logs/dock-%j.out
 #SBATCH --signal=B:USR1@600
 
