@@ -5,9 +5,11 @@
 #SBATCH --job-name=kdc-convert
 #SBATCH -N 1
 #SBATCH -p zen4_0768
-#SBATCH --qos zen4_0768
+#SBATCH --qos idle_zen4_0768
 #SBATCH --threads-per-core=1
 #SBATCH --time=02:00:00
+#SBATCH --mail-user=thomas.roessel@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=logs/convert-%j.out
 
 set -uo pipefail
