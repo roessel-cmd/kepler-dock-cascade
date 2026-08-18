@@ -22,6 +22,17 @@
 # Voraussetzung: die Liganden liegen bereits als PDBQT vor (Stufe 1 ist
 # nicht Teil der Messung), und TARGET/config.txt enthaelt mindestens ein
 # Target mit vorhandenem Rezeptor-PDBQT.
+#
+# ── Aenderungen gegenueber der Erstfassung ─────────────────────────────────
+#   * nvidia-smi tastet nur noch die tatsaechlich genutzten GPUs ab
+#     (BENCH_SMI_IDS). Vorher wurden bei einem 1-GPU-Lauf auf einem
+#     4-GPU-Knoten drei idle Karten mitgemittelt -> Auslastung ~25 %.
+#   * Aufwaermlauf nutzt die maximale GPU-Zahl der Matrix, nicht fix 1.
+#   * BUGFIX prepare_ligands: 'find -L' bei BENCH_N_LIGANDS=0
+#     (find folgt Symlinks nicht -> Zaehlung lieferte immer 0).
+#   * BUGFIX Ligandenzaehlung: FNR>1 statt NR>1 (NR ueberspringt nur den
+#     Header der ersten CSV).
+#   * Auswertung: Kopfzeile laeuft nicht mehr durch 'sort'.
 # ============================================================================
 
 set -uo pipefail
@@ -60,18 +71,33 @@ fi
 # der Speedup fuer 4:detail keine Basis haette. Wenn die Zeit knapp ist:
 # diese eine Zeile streichen – 4:detail wird dann zu seiner eigenen Basis
 # und zeigt Speedup 1.00x, der Durchsatzwert bleibt aber gueltig.
+#
+# Besser als streichen: 'detail' als EIGENE Messreihe mit kleinerem
+# Ligandensatz fahren. Die Speedup-Basis wird unten je (Modus, Batch)
+# gebildet, Modi sind also ohnehin voneinander unabhaengig:
+#     BENCH_OUT=bench_fb     BENCH_N_LIGANDS=200000 BENCH_RUNS="1:fast:... "
+#     BENCH_OUT=bench_detail BENCH_N_LIGANDS=40000  BENCH_RUNS="1:detail:..."
+# Nur die absoluten L/h sind zwischen den Reihen nicht vergleichbar – das
+# waren sie zwischen Modi aber ohnehin nie.
 
 # ── Batch-Sweep ────────────────────────────────────────────────────────────
 # Die eigentliche Stellschraube fuer die SM-Auslastung: batch_size bestimmt,
 # wieviele Liganden Uni-Dock in einen gemeinsamen CUDA-Launch packt. Der
 # Standardwert 1000 ist gesetzt, nicht gemessen.
 #
+# REIHENFOLGE: erst Batch-Sweep auf EINER Karte, dann die Skalierungsmatrix
+# mit dem gefundenen Batch. Andersherum misst man die Skalierung eines
+# falsch parametrierten Systems – und die sieht sogar gut aus, weil eine
+# unterausgelastete Karte fast linear skaliert.
+#
 # Als EIGENE Messreihe fahren, nicht in dieselbe Matrix mischen: die
 # GPU-Skalierung beantwortet "wie gut verteilt der Orchestrator", der
 # Batch-Sweep "wie gut saettigt die Engine". Dazu oben RUNS auskommentieren
 # und stattdessen:
-# RUNS=("4:balance:250" "4:balance:500" "4:balance:1000"
-#       "4:balance:2000" "4:balance:4000" "4:balance:8000")
+# RUNS=("1:balance:250" "1:balance:500" "1:balance:1000"
+#       "1:balance:2000" "1:balance:4000" "1:balance:8000")
+# Auf H100 (80 GB) ruhig bis 16000/32000 verlaengern, bis der Durchsatz
+# plateaut oder OOM kommt. Beides ist ein Ergebnis.
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -91,16 +117,40 @@ BENCH_OUT="${BENCH_OUT:-benchmark}"       # Ergebnisverzeichnis (Logs + CSV)
 # Bevor du die ganze Matrix startest: einmal mit 2000 durchlaufen lassen.
 # Das dauert wenige Minuten und zeigt, ob Auswertung, GPU-Telemetrie und
 # CSV stimmen. Danach hochsetzen und die eigentliche Messung fahren.
+#
+# AUF SCHNELLER HARDWARE NEU KALIBRIEREN. t0 wird vor dem Python-Start
+# gesetzt, d.h. Container-Start, GPU-Init und Ligandenscan stecken in
+# wall_s. Sockel einmalig messen:
+#     BENCH_OUT=bench_overhead BENCH_N_LIGANDS=100 BENCH_WARMUP=false \
+#     BENCH_RUNS="4:fast:1000" ./benchmark.sh
+# Danach den Messsatz so waehlen, dass der SCHNELLSTE Lauf der Matrix
+# mindestens das 10- bis 20-fache dieses Sockels dauert.
 BENCH_N_LIGANDS="${BENCH_N_LIGANDS:-15000}"
 
 # Ein Aufwaermlauf vor der Messung. Der erste Lauf zahlt Page-Cache,
 # GPU-Initialisierung und Container-Start; ohne Aufwaermen sieht der
 # erste Matrixeintrag systematisch schlechter aus als er ist.
+# Er laeuft mit der maximalen GPU-Zahl der Matrix (siehe unten), sonst
+# zahlt der erste Mehr-GPU-Lauf die Init der uebrigen Karten.
 BENCH_WARMUP="${BENCH_WARMUP:-true}"
 BENCH_WARMUP_LIGANDS=2000
 
 # Abtastintervall fuer nvidia-smi in Sekunden. 0 = keine GPU-Telemetrie.
 BENCH_SAMPLE_INTERVAL=5
+
+# Welche GPUs nvidia-smi abtastet. Leer = automatisch 0..(gpus-1) je Lauf.
+# Das ist richtig, solange der Orchestrator bei num_gpus=N die Karten 0..N-1
+# nimmt. Wird per CUDA_VISIBLE_DEVICES eine andere Auswahl erzwungen (etwa
+# CUDA_VISIBLE_DEVICES=1 auf einer Workstation mit ungleichen Karten), muss
+# hier die PHYSISCHE Index-Liste stehen, die nvidia-smi sieht:
+#     BENCH_SMI_IDS=1 CUDA_VISIBLE_DEVICES=1 ./benchmark.sh
+BENCH_SMI_IDS="${BENCH_SMI_IDS:-}"
+
+# Hinweis zur Interpretation: utilization.gpu ist der Zeitanteil, in dem
+# IRGENDEIN Kernel resident war – nicht die SM-Belegung. Auf H100 steht dort
+# 100 %, auch wenn die SMs zu 15 % ausgelastet sind. Als Saettigungsindikator
+# taugt die Spalte nicht; dafuer ist allein die Durchsatzkurve ueber
+# batch_size aussagekraeftig (bzw. DCGM_FI_PROF_SM_OCCUPANCY, falls da).
 
 # Seed fuer reproduzierbare Laeufe. 0 = zufaellig (nicht empfohlen fuer
 # eine Messreihe, weil Sampling-Unterschiede in den Durchsatz eingehen).
@@ -140,21 +190,43 @@ RESULTS_DIR="$(ini_get PATHS results_dir)"
 LOG_DIR="$(ini_get PATHS log_dir)"
 PDBQT_DIR="${PDBQT_DIR#./}"; RESULTS_DIR="${RESULTS_DIR#./}"; LOG_DIR="${LOG_DIR#./}"
 
+# Maximale GPU-Zahl der Matrix (fuer den Aufwaermlauf)
+BENCH_MAX_GPUS=1
+for spec in "${RUNS[@]}"; do
+    g="${spec%%:*}"
+    case "$g" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    [ "$g" -gt "$BENCH_MAX_GPUS" ] && BENCH_MAX_GPUS="$g"
+done
+
 banner "DOCKING BENCHMARK"
 say "Projekt   : $PROJECT_DIR"
 say "Liganden  : $PROJECT_DIR/$PDBQT_DIR"
-say "Laeufe    : ${#RUNS[@]}"
+say "Laeufe    : ${#RUNS[@]}  (max ${BENCH_MAX_GPUS} GPU)"
+[ -n "$BENCH_SMI_IDS" ] && say "smi-IDs   : $BENCH_SMI_IDS (fest)"
 [ "$DRY_RUN" = true ] && warn "DRY-RUN"
 
 for f in "$BENCH_SIF" "$BENCH_INI_TEMPLATE" "src/orchestrator.py" "TARGET/config.txt"; do
     [ -e "$PROJECT_DIR/$f" ] || { err "Fehlt: $f"; exit 1; }
 done
 
+# Fremde Last auf dem Knoten verfaelscht sowohl Durchsatz als auch Telemetrie
+if [ "$DRY_RUN" != true ] && command -v nvidia-smi >/dev/null 2>&1; then
+    foreign=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    [ "$foreign" -gt 0 ] && warn "$foreign fremde Compute-Prozesse auf den GPUs – Knoten nicht exklusiv?"
+fi
+
 mkdir -p "$PROJECT_DIR/$BENCH_OUT"
 SUMMARY="$PROJECT_DIR/$BENCH_OUT/summary.csv"
 
 # ── Ligandenausschnitt: fester Satz fuer alle Laeufe ────────────────────────
 # Symlinks statt Kopien – die Bibliothek kann Millionen Dateien umfassen.
+# Auf Lustre/GPFS ist das ein Risiko: vier GPUs ziehen dann hunderttausende
+# kleine PDBQT ueber das Netzwerk-FS, und gemessen wird die Metadaten-
+# Performance, nicht die Engine. Gegenprobe: Messsatz nach $TMPDIR (node-
+# lokales NVMe) kopieren und einen Lauf wiederholen. Dafuer 'ln -s' unten
+# durch 'cp' ersetzen.
 BENCH_LIG_DIR="$PROJECT_DIR/$BENCH_OUT/ligands"
 prepare_ligands() {   # $1 = Anzahl, $2 = Zielverzeichnis
     local n="$1" dst="$2"
@@ -166,15 +238,19 @@ prepare_ligands() {   # $1 = Anzahl, $2 = Zielverzeichnis
             | sort | head -n "$n" \
             | while read -r f; do ln -s "$f" "$dst/"; done
     fi
-    find "$dst" -name '*.pdbqt' 2>/dev/null | wc -l
+    # -L: ohne das folgt find dem Verzeichnis-Symlink im n=0-Fall nicht und
+    # liefert 0. Bei n=0 und Millionen Dateien dauert das Zaehlen entsprechend.
+    find -L "$dst" -name '*.pdbqt' 2>/dev/null | wc -l
 }
 
 # ── GPU-Telemetrie ─────────────────────────────────────────────────────────
-start_sampling() {   # $1 = Ausgabedatei
+start_sampling() {   # $1 = Ausgabedatei, $2 = GPU-Indexliste (leer = alle)
     [ "$BENCH_SAMPLE_INTERVAL" -eq 0 ] && return 0
+    local ids="${2:-}"
     nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw \
                --format=csv,noheader,nounits \
-               -l "$BENCH_SAMPLE_INTERVAL" > "$1" 2>/dev/null &
+               ${ids:+-i "$ids"} \
+               -l "$BENCH_SAMPLE_INTERVAL" > "$1" 2>"${1%.csv}.err" &
     echo $!
 }
 
@@ -200,6 +276,14 @@ run_one() {   # $1 = Nummer, $2 = gpus, $3 = mode, $4 = batch, $5 = ligandenzahl
     local log="$PROJECT_DIR/$BENCH_OUT/${label}.log"
     local smi="$PROJECT_DIR/$BENCH_OUT/${label}.gpu.csv"
 
+    # Nur die tatsaechlich genutzten Karten abtasten. Ohne diese Einschraenkung
+    # mitteln idle Karten die Auslastung herunter (1 von 4 GPUs -> ~25 %), was
+    # in der Ergebnistabelle wie ein Skalierungsbefund aussieht und keiner ist.
+    local ids="$BENCH_SMI_IDS"
+    if [ -z "$ids" ]; then
+        ids=$(seq -s, 0 $(( gpus - 1 )))
+    fi
+
     banner "LAUF $num — ${gpus} GPU | $mode | batch $batch | chunk $chunk | $nlig Liganden"
 
     # INI aus der Vorlage ableiten
@@ -214,6 +298,7 @@ run_one() {   # $1 = Nummer, $2 = gpus, $3 = mode, $4 = batch, $5 = ligandenzahl
     if [ "$DRY_RUN" = true ]; then
         printf '   (dry-run) python3 src/orchestrator.py --config %s --stage dock --sif %s\n' \
             "${ini#$PROJECT_DIR/}" "$BENCH_SIF"
+        printf '   (dry-run) nvidia-smi -i %s\n' "$ids"
         return 0
     fi
 
@@ -223,7 +308,7 @@ run_one() {   # $1 = Nummer, $2 = gpus, $3 = mode, $4 = batch, $5 = ligandenzahl
     mkdir -p "$PROJECT_DIR/$RESULTS_DIR"
     rm -f "$PROJECT_DIR/$LOG_DIR/pipeline.log"
 
-    local smi_pid; smi_pid=$(start_sampling "$smi")
+    local smi_pid; smi_pid=$(start_sampling "$smi" "$ids")
     local t0; t0=$(date +%s)
 
     python3 "$PROJECT_DIR/src/orchestrator.py" \
@@ -236,11 +321,18 @@ run_one() {   # $1 = Nummer, $2 = gpus, $3 = mode, $4 = batch, $5 = ligandenzahl
     local dt=$(( $(date +%s) - t0 ))
     stop_sampling "$smi_pid"
 
+    # Telemetrie still gescheitert? Dann sind util/power/mem leer, und man
+    # soll wissen warum, statt Leerzeichen in der CSV zu interpretieren.
+    if [ "$BENCH_SAMPLE_INTERVAL" -ne 0 ] && [ ! -s "$smi" ]; then
+        warn "Keine GPU-Telemetrie (siehe ${smi%.csv}.err)"
+    fi
+
     # Erfolgreiche Liganden aus den Chunk-CSVs zaehlen (nicht aus dem Log:
-    # der Durchsatz soll auf tatsaechlich gedockten Molekuelen beruhen)
+    # der Durchsatz soll auf tatsaechlich gedockten Molekuelen beruhen).
+    # FNR statt NR: NR ueberspringt nur den Header der ERSTEN Datei.
     local n_ok
     n_ok=$(find "$PROJECT_DIR/$RESULTS_DIR" -name 'docking_results_*.csv' \
-           -exec awk -F, 'NR>1 && $2=="True"' {} + 2>/dev/null | wc -l)
+           -exec awk -F, 'FNR>1 && $2=="True"' {} + 2>/dev/null | wc -l)
 
     local lph=0
     [ "$dt" -gt 0 ] && lph=$(awk -v n="$n_ok" -v t="$dt" 'BEGIN{printf "%.0f", n/t*3600}')
@@ -261,9 +353,9 @@ run_one() {   # $1 = Nummer, $2 = gpus, $3 = mode, $4 = batch, $5 = ligandenzahl
 if [ "$BENCH_WARMUP" = true ] && [ "$DRY_RUN" != true ]; then
     banner "AUFWAERMLAUF (wird nicht gewertet)"
     n=$(prepare_ligands "$BENCH_WARMUP_LIGANDS" "$BENCH_LIG_DIR")
-    say "$n Liganden"
+    say "$n Liganden auf ${BENCH_MAX_GPUS} GPU"
     SUMMARY_BAK="$SUMMARY"; SUMMARY="/dev/null"
-    run_one 0 1 fast 1000 "$n"
+    run_one 0 "$BENCH_MAX_GPUS" fast 1000 "$n"
     SUMMARY="$SUMMARY_BAK"
 fi
 
@@ -275,6 +367,7 @@ N_LIG=0
 if [ "$DRY_RUN" != true ]; then
     N_LIG=$(prepare_ligands "$BENCH_N_LIGANDS" "$BENCH_LIG_DIR")
     say "Messsatz: $N_LIG Liganden (identisch fuer alle Laeufe)"
+    [ "$N_LIG" -eq 0 ] && { err "Keine Liganden gefunden – pdbqt_dir pruefen"; exit 1; }
 fi
 
 i=1
@@ -288,6 +381,13 @@ done
 [ "$DRY_RUN" = true ] && exit 0
 
 banner "ERGEBNIS"
+
+# Kopf ausserhalb von awk, sonst sortiert 'sort' die Trennlinie ueber die
+# Ueberschrift.
+printf "  %-4s %-5s %-9s %-7s %10s %8s %9s %8s %7s %7s\n" \
+       "Run" "GPUs" "Modus" "Batch" "Liganden" "Zeit_s" "L/h" "Speedup" "Eff_%" "GPU_%"
+printf "  %s\n" "---------------------------------------------------------------------------------------"
+
 awk -F, 'NR==1 {next}
 {
     key = $3 "_" $4
@@ -295,9 +395,6 @@ awk -F, 'NR==1 {next}
     rows[NR]=$0
 }
 END {
-    printf "  %-4s %-5s %-9s %-7s %10s %8s %9s %8s %7s %7s\n",
-           "Run","GPUs","Modus","Batch","Liganden","Zeit_s","L/h","Speedup","Eff_%","GPU_%"
-    printf "  %s\n", "---------------------------------------------------------------------------------------"
     for (r in rows) {
         split(rows[r], f, ",")
         key = f[3] "_" f[4]
@@ -317,3 +414,7 @@ echo "  kleinsten GPU-Zahl bei gleichem Modus und gleicher Batch-Groesse."
 echo "  Effizienz unter 100 % heisst: die zusaetzlichen GPUs bringen weniger"
 echo "  als linear – typische Ursachen sind Dispatch-Overhead, zu grosse"
 echo "  Chunks am Ende des Laufs oder ein zu kleiner Messsatz."
+echo
+echo "  Vorsicht bei ungleichen Karten (Workstation): dort sind Speedup und"
+echo "  Effizienz bedeutungslos, weil die schnellere Karte auf die langsamere"
+echo "  wartet. Nur Batch-Sweep und Einzelkarten-Durchsatz sind dort gueltig."
