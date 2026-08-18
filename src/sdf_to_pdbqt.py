@@ -74,8 +74,35 @@ def make_output_path(out_dir: Path, mol_name: str, mol_index: int,
     return out_dir / f"{subdir_idx:04d}" / f"{mol_name}.pdbqt"
 
 
-def safe_mol_name(rdkit_name: str, fallback_index: int) -> str:
-    """Erzeugt einen dateisystemtauglichen Molekülnamen."""
+def sanitize_prefix(prefix: str) -> str:
+    """Macht einen Namenspraefix dateisystemtauglich und normiert den Trenner.
+
+    Aus 'LIB_02', 'LIB_02_' und 'LIB 02' wird jeweils 'LIB_02'; angehaengt
+    wird spaeter immer genau ein '_'. So ist es egal, wie der Aufrufer den
+    Praefix schreibt.
+    """
+    if not prefix:
+        return ""
+    cleaned = "".join(
+        c if (c.isalnum() or c in "._-") else "_"
+        for c in prefix.strip()
+    )
+    return cleaned.strip("_.-")[:20]
+
+
+def safe_mol_name(rdkit_name: str, fallback_index: int, prefix: str = "") -> str:
+    """Erzeugt einen dateisystemtauglichen Molekülnamen.
+
+    Der Praefix ist der Grund, warum es diese Funktion in dieser Form gibt:
+    fallback_index zaehlt PRO LAUF ab 0. Werden mehrere Bibliotheken in
+    getrennten Laeufen konvertiert, vergibt jede die Namen mol_0000000,
+    mol_0000001, ... erneut. Die PDBQT liegen zwar in getrennten Ordnern und
+    kollidieren dort nicht – aber die Docking-Ergebnisse landen flach in
+    einem Verzeichnis pro Target und ueberschreiben sich dann gegenseitig.
+    Ein Praefix je Bibliothek ('LIB_02' -> 'LIB_02_mol_0000000') macht den
+    Namensraum global eindeutig.
+    """
+    pre = f"{prefix}_" if prefix else ""
     if rdkit_name:
         # Whitespace und problematische Zeichen ersetzen
         cleaned = "".join(
@@ -83,8 +110,10 @@ def safe_mol_name(rdkit_name: str, fallback_index: int) -> str:
             for c in rdkit_name.strip()
         )
         if cleaned:
-            return cleaned[:60]  # Längen-Cap fuer Dateisysteme
-    return f"mol_{fallback_index:07d}"
+            # Laengen-Cap fuer Dateisysteme; der Praefix zaehlt mit, damit
+            # das Ergebnis nicht ueber die Grenze waechst.
+            return (pre + cleaned)[:60]
+    return f"{pre}mol_{fallback_index:07d}"
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -463,7 +492,8 @@ def producer_loop(sdf_file_str: str,
                   input_format: str = "sdf",
                   smiles_col: str = "",
                   name_col: str = "",
-                  log_dir_str: str = "") -> None:
+                  log_dir_str: str = "",
+                  name_prefix: str = "") -> None:
     """
     Liest die Eingabe und sendet (index, payload, name, format) in die
     job_queue. Schliesst mit num_workers Sentinels.
@@ -479,6 +509,13 @@ def producer_loop(sdf_file_str: str,
     Zwei Eintraege mit gleichem Namen wuerden sich dort ueberschreiben, ohne
     Fehlermeldung. Deshalb wird jeder Name nur einmal durchgelassen und die
     Duplikate in duplicate_names.log geschrieben.
+
+    ACHTUNG, Reichweite dieser Pruefung: seen_names lebt nur fuer DIESEN
+    Lauf. Sie faengt Duplikate INNERHALB einer Eingabedatei, nicht ueber
+    mehrere Bibliotheken hinweg. Werden fuenf Bibliotheken nacheinander
+    konvertiert und haben die Molekuele keine eigenen Namen, vergibt jeder
+    Lauf erneut mol_0000000 aufwaerts – und die Kollision faellt erst beim
+    Docking auf. Dagegen hilft --name-prefix je Bibliothek.
     """
     sdf_path = Path(sdf_file_str)
     out_dir  = Path(out_dir_str) if out_dir_str else None
@@ -487,6 +524,8 @@ def producer_loop(sdf_file_str: str,
     skipped   = 0    # bereits konvertiert
     duplicate = 0    # Name schon vergeben
     unnamed   = 0    # kein Name in der Eingabe, Fallback mol_XXXXXXX
+
+    prefix = sanitize_prefix(name_prefix)
 
     seen_names: set[str] = set()
     dup_log = (Path(log_dir_str) / "duplicate_names.log") if log_dir_str else None
@@ -502,7 +541,7 @@ def producer_loop(sdf_file_str: str,
         for payload, raw_name in source:
             if not raw_name.strip():
                 unnamed += 1
-            mol_name = safe_mol_name(raw_name, sent)
+            mol_name = safe_mol_name(raw_name, sent, prefix)
 
             # Namenskollision: zweiter Eintrag wird verworfen, nicht
             # ueberschrieben. Der Index laeuft weiter (siehe unten).
@@ -541,8 +580,21 @@ def producer_loop(sdf_file_str: str,
         parts.append(f"{duplicate:,} Namensduplikate verworfen"
                      + (f" -> {dup_log}" if dup_log else ""))
     if unnamed:
-        parts.append(f"{unnamed:,} ohne Namen (Fallback mol_XXXXXXX)")
+        fb = f"{prefix}_mol_XXXXXXX" if prefix else "mol_XXXXXXX"
+        parts.append(f"{unnamed:,} ohne Namen (Fallback {fb})")
     print("[Producer] " + " | ".join(parts), flush=True)
+
+    # Der gefaehrliche Fall: keine Namen in der Eingabe UND kein Praefix.
+    # Solange nur eine Bibliothek konvertiert wird, geht das gut; ab der
+    # zweiten kollidieren die Namen, und zwar erst sichtbar beim Docking.
+    if unnamed and not prefix:
+        print(
+            f"[Producer] WARNUNG: {unnamed:,} Molekuele ohne eigenen Namen, "
+            f"kein --name-prefix gesetzt. Die Namen mol_0000000... werden in "
+            f"jeder Bibliothek neu vergeben und ueberschreiben sich beim "
+            f"Docking. Bei mehreren Bibliotheken: --name-prefix <LIB> setzen.",
+            flush=True,
+        )
 
     # Sentinel pro Worker
     for _ in range(num_workers):
@@ -609,6 +661,15 @@ def parse_args() -> argparse.Namespace:
                          "(.csv=Spalte 0 / .smi=Spalte 1).")
     ap.add_argument("--out-dir",  required=True, type=Path,
                     help="Ausgabe-Verzeichnis fuer PDBQTs.")
+    ap.add_argument("--name-prefix", default="",
+                    help="Praefix fuer alle Molekuelnamen, z.B. 'LIB_02' -> "
+                         "'LIB_02_mol_0000000'. NOETIG, sobald mehrere "
+                         "Bibliotheken gegen dasselbe Target gedockt werden "
+                         "und die Molekuele keine eigenen Namen mitbringen: "
+                         "der Fallback-Zaehler startet pro Lauf bei 0, die "
+                         "Docking-Ergebnisse wuerden sich sonst still "
+                         "ueberschreiben. 'auto' leitet den Praefix aus dem "
+                         "Namen von --out-dir ab.")
     ap.add_argument("--skip-existing", action="store_true",
                     help="Molekuele ueberspringen, deren PDBQT bereits "
                          "vorhanden und nicht leer ist. Fuer die Wiederaufnahme "
@@ -647,6 +708,12 @@ def main() -> int:
     args.log_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(args.log_dir)
 
+    # 'auto': Praefix aus dem Ausgabeverzeichnis ableiten. Bei einem Aufruf
+    # mit --out-dir data/PDBQT/LIB_02 wird daraus 'LIB_02'. Das ist genau
+    # die Konvention, mit der die Pipeline die Bibliotheken ablegt.
+    if args.name_prefix == "auto":
+        args.name_prefix = args.out_dir.name
+
     logger.info("=== %s → PDBQT KONVERTIERUNG (Streaming, RDKit + Meeko) ===",
                 "SMILES" if in_format == "smiles" else "SDF")
     logger.info("  Eingabe          : %s", in_path)
@@ -657,6 +724,8 @@ def main() -> int:
     logger.info("  Timeout/Molekül  : %ds", args.timeout)
     logger.info("  Output-Layout    : %s",
                 "flat" if args.flat else f"Unterordner à {FILES_PER_SUBDIR} Dateien")
+    logger.info("  Namenspraefix    : %s",
+                sanitize_prefix(args.name_prefix) or "(keiner)")
 
     ctx = mp.get_context("spawn")  # spawn ist robuster als fork bei großen Libs
     job_queue:     mp.Queue = ctx.Queue(maxsize=QUEUE_MAXSIZE)
@@ -670,7 +739,8 @@ def main() -> int:
         target=producer_loop,
         args=(str(in_path), job_queue, args.workers, control_queue,
               str(args.out_dir), args.flat, args.skip_existing,
-              in_format, args.smiles_col, args.name_col, str(args.log_dir)),
+              in_format, args.smiles_col, args.name_col, str(args.log_dir),
+              args.name_prefix),
         name="producer",
         daemon=True,
     )
