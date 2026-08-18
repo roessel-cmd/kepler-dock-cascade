@@ -34,7 +34,30 @@ CHAIN_MAX=${CHAIN_MAX:-20}
 CHAIN_INDEX=${CHAIN_INDEX:-1}
 DOCK_INI="config/docking.ini"
 
+# Mindestfortschritt pro Kettenglied. Bleibt ein Lauf darunter, ohne dass er
+# an der Walltime abgebrochen wurde, endet die Kette. Frueher galt schon ein
+# einziger Ligand als Fortschritt – bei einem Fehler, der 99 % der Ergebnisse
+# still verwirft, waeren so alle CHAIN_MAX Glieder durchgelaufen.
+MIN_PROGRESS=${MIN_PROGRESS:-1000}
+
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+# Zahl der offenen Liganden. Gibt bei jedem Fehler "-1" aus, damit der
+# Aufrufer den Unterschied zwischen "0 offen" und "nicht ermittelbar" sieht;
+# eine leere Variable wuerde jeden spaeteren Vergleich still fehlschlagen
+# lassen und damit den Abbruchwaechter deaktivieren.
+remaining_count() {
+    python3 src/pipeline_progress.py "$DOCK_INI" --json 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["remaining"])' 2>/dev/null \
+        || echo -1
+}
+
+is_count() {   # nur nichtnegative Ganzzahlen sind gueltig ("-1" also nicht)
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+        *)           return 0 ;;
+    esac
+}
 
 log "Docking — Kettenglied $CHAIN_INDEX von max. $CHAIN_MAX"
 log "Job ${SLURM_JOB_ID:-?} auf $(hostname -s) | GPUs ${SLURM_GPUS_ON_NODE:-?}"
@@ -45,9 +68,14 @@ case $? in
     2) log "FEHLER: Fortschritt nicht ermittelbar — Kette endet."; exit 2 ;;
 esac
 
-REMAINING_BEFORE=$(python3 src/pipeline_progress.py "$DOCK_INI" --json \
-                   | python3 -c 'import json,sys; print(json.load(sys.stdin)["remaining"])')
-log "Offen vor dem Lauf: $REMAINING_BEFORE"
+REMAINING_BEFORE=$(remaining_count)
+if ! is_count "$REMAINING_BEFORE"; then
+    # Bewusst vor dem Einreichen des Folgejobs: ohne belastbaren Startwert
+    # kann der Waechter unten nicht arbeiten, und die Kette liefe blind.
+    log "FEHLER: Offene Liganden vor dem Lauf nicht ermittelbar — Kette endet."
+    exit 2
+fi
+log "Offen vor dem Lauf: $REMAINING_BEFORE (Mindestfortschritt: $MIN_PROGRESS)"
 
 # Folgejob VORAB einreichen: mit afterany entsteht er auch dann, wenn dieser
 # Job an der Walltime stirbt. Pfad explizit, nicht "$0" — das zeigt auf die
@@ -103,15 +131,23 @@ while kill -0 "$PIPELINE_PID" 2>/dev/null; do sleep 5; done
 log "Pipeline beendet, Exit $RC (terminating=$TERMINATING)"
 
 python3 src/pipeline_progress.py "$DOCK_INI"
-REMAINING_AFTER=$(python3 src/pipeline_progress.py "$DOCK_INI" --json \
-                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["remaining"])' 2>/dev/null || echo -1)
+REMAINING_AFTER=$(remaining_count)
 log "Offen nach dem Lauf: $REMAINING_AFTER (vorher $REMAINING_BEFORE)"
 
 CANCEL_REASON=""
-if [ "$REMAINING_AFTER" = "0" ]; then
+if ! is_count "$REMAINING_AFTER"; then
+    # Frueher lief die Kette hier weiter: -1 ist weder 0 noch gleich
+    # REMAINING_BEFORE, also griff kein Abbruchgrund.
+    CANCEL_REASON="Fortschritt nicht ermittelbar (Exit $RC)"
+elif [ "$REMAINING_AFTER" -eq 0 ]; then
     CANCEL_REASON="alles abgearbeitet"
-elif [ "$TERMINATING" -eq 0 ] && [ "$REMAINING_AFTER" = "$REMAINING_BEFORE" ]; then
-    CANCEL_REASON="kein Fortschritt (Exit $RC)"
+elif [ "$TERMINATING" -eq 0 ]; then
+    PROGRESS=$(( REMAINING_BEFORE - REMAINING_AFTER ))
+    if [ "$PROGRESS" -lt "$MIN_PROGRESS" ]; then
+        CANCEL_REASON="zu wenig Fortschritt: $PROGRESS statt mindestens $MIN_PROGRESS (Exit $RC)"
+    else
+        log "Fortschritt: $PROGRESS Liganden"
+    fi
 fi
 
 if [ -n "$CANCEL_REASON" ] && [ -n "$NEXT_JOB" ]; then
@@ -119,4 +155,11 @@ if [ -n "$CANCEL_REASON" ] && [ -n "$NEXT_JOB" ]; then
     scancel "$NEXT_JOB" 2>/dev/null && log "Folgejob $NEXT_JOB storniert."
 fi
 
-exit 0
+# Exit-Code der Pipeline durchreichen. Frueher stand hier 'exit 0', wodurch
+# der Job immer als erfolgreich galt und --mail-type=FAIL nie ausgeloest hat.
+# Die Kette haengt an afterany und ist davon unberuehrt.
+if [ "$TERMINATING" -eq 1 ]; then
+    log "Walltime-Abbruch — als Erfolg gewertet, Folgejob macht weiter."
+    exit 0
+fi
+exit "$RC"
