@@ -110,6 +110,25 @@ cp ../src/{worker_rescore.py,docking_rescore.py,gnina_refinement.py} .
 cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py,ecr.py} .
 apptainer build ../rescoring-gpu.sif rescoring-gpu.def
 ```
+Build the three containers (with -fakeroot):
+
+```bash
+cd build/
+
+# Stage 1
+cp ../src/sdf_to_pdbqt.py .
+apptainer build --ignore-fakeroot-command ../sdf_to_pdbqt.sif sdf_to_pdbqt.def
+
+# Stage 2
+cp ../src/{pipeline_common.py,docking_config.py,unidock_engine.py} .
+cp ../src/{worker_dock.py,worker_restart_dock.py} .
+apptainer build --ignore-fakeroot-command ../unidock-gpu.sif unidock-gpu.def
+
+# Stage 3 — gnina muss bereits in build/ liegen
+cp ../src/{worker_rescore.py,docking_rescore.py,gnina_refinement.py} .
+cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py,ecr.py} .
+apptainer build --ignore-fakeroot-command ../rescoring-gpu.sif rescoring-gpu.def
+```
 
 Apptainer resolves `%files` relative to the working directory, so the modules
 have to be copied into `build/` before each build. Rather than tracking that by
