@@ -6,9 +6,11 @@ Validation analysis for DUD-E docking results (gnina rescoring).
 Protokoll: Pose 1 aus dem Vina-Ranking, danach Re-Ranking nach ECR bzw.
 den Einzelscores. Die Pose wird bewusst NICHT nach ECR gewaehlt — das
 waere eine Auswahl auf derselben Groesse, die anschliessend bewertet wird.
-ecr_cross_validation.py verfaehrt hier anders (Best-Pose nach ECR); die
-sigma_fraction aus der Kreuzvalidierung ist deshalb nicht 1:1 auf dieses
-Skript uebertragbar.
+ecr_cross_validation.py bewertet bewusst das andere Protokoll (Best-Pose
+nach ECR): dort die obere Schranke bei geloester Pose-Auswahl, hier der
+prospektive Fall. sigma_fraction ist zwischen beiden uebertragbar, weil
+sigma = N/f den Abfall in Perzentilen definiert und nicht in absoluten
+Raengen.
 
 Pro Target: ROC/AUC, Enrichment Factors, Score-Verteilungen, PR/AUPRC,
 Cohen's d und KS, Score-Korrelationen. Ueber alle Targets zusaetzlich
@@ -190,9 +192,8 @@ def recompute_ecr(df: pd.DataFrame, sigma_fraction: int = ECR_SIGMA_FRACTION) ->
         df["ecr_total"] = 0.0
         return df
 
-    # N sind hier LIGANDEN (Pose-1-Filter lief schon). In
-    # ecr_cross_validation.py sind es Posen — dieselbe sigma_fraction bedeutet
-    # dort also ein anderes sigma.
+    # rank/sigma = sigma_fraction * (rank/N), also perzentilbasiert: der
+    # Wert ist unabhaengig davon, ob N Liganden oder Posen zaehlt.
     sigma = max(N / sigma_fraction, 1.0)
     weight = 1.0 / len(enabled_cols)
 

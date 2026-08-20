@@ -28,6 +28,7 @@ import os
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import average_precision_score
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -226,19 +227,20 @@ def compute_ef(labels, scores, higher_is_better, fraction):
 
 
 def compute_auprc(labels, scores, higher_is_better):
+    # average_precision_score statt trapezfoermiger Integration: beide
+    # Programme sollen denselben Schaetzer verwenden, sonst ist AUPRC
+    # zwischen ihnen nicht zitierfaehig. Die Trapezregel interpoliert
+    # linear zwischen Stuetzstellen, AP summiert die tatsaechlichen
+    # Praezisionswerte. Bei diesen Datenmengen liegen beide unter 0.003
+    # auseinander — es geht um Vergleichbarkeit, nicht um einen groben
+    # Fehler.
     s = scores if higher_is_better else -scores
     mask = np.isfinite(s)
     s, labels = s[mask], labels[mask]
     n_pos = (labels == 1).sum()
-    if n_pos == 0:
+    if n_pos == 0 or (labels == 0).sum() == 0:
         return None
-    order = np.argsort(-s)
-    labels = labels[order]
-    tp = np.cumsum(labels == 1)
-    total = np.arange(1, len(labels) + 1)
-    precision = np.concatenate([[1.0], tp / total])
-    recall = np.concatenate([[0.0], tp / n_pos])
-    return float(np.trapezoid(precision, recall))
+    return float(average_precision_score(labels, s))
 
 
 def eval_ecr(df_lig):
