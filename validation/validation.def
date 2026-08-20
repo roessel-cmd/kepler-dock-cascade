@@ -1,0 +1,43 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%labels
+    Author      roessel
+    Description DUD-E validation environment (enrichment analysis + ECR cross-validation)
+    Version     1.0
+
+%post
+    # System-Pakete
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Python Dependencies
+    pip install --no-cache-dir \
+        numpy \
+        pandas \
+        matplotlib \
+        scipy \
+        scikit-learn
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export MPLBACKEND=Agg
+
+%runscript
+    exec python3 "$@"
+
+%help
+    DUD-E Validierungs-Container.
+
+    Build:
+        apptainer build --fakeroot validation.sif validation.def
+        # oder mit sudo:
+        sudo apptainer build validation.sif validation.def
+
+    Run (Skripte per Bind-Mount):
+        apptainer exec \
+            --bind /home/roessel/gpu8.0:/data \
+            validation.sif \
+            python3 /scripts/enrichment_analysis.py
