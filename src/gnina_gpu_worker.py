@@ -388,10 +388,15 @@ class GninaGPUScorer:
         if max_poses_per_batch <= 0:
             try:
                 free_mem, _total_mem = torch.cuda.mem_get_info(self.gpu_id)
-                # ~12 MB pro Pose (48^3 * 28 channels * 4 bytes + Overhead)
-                # Konservativ: 50% des freien Speichers nutzen
+                # Gemessen am 21.08.2026: ein Batch mit 3950 Posen wollte
+                # 13.02 GiB, also ~3.4 MB/Pose. Die alte Schaetzung von
+                # 12 MB war zu grosszuegig und die 50 %-Regel zu knapp,
+                # sobald ein zweites Modell (dense) im Speicher liegt.
+                # Deckel bei 2000, damit ein einzelner Fehlschlag nicht
+                # gleich Tausende Posen in den Retry zieht.
                 mem_per_pose = 12 * 1024 * 1024
-                max_poses_per_batch = max(10, int(free_mem * 0.5 / mem_per_pose))
+                max_poses_per_batch = max(
+                    10, min(2000, int(free_mem * 0.25 / mem_per_pose)))
                 _log.info("GninaGPUScorer: Auto batch_size=%d (%.1f GB frei)",
                           max_poses_per_batch, free_mem / 1e9)
             except Exception:
@@ -432,20 +437,54 @@ class GninaGPUScorer:
             {} for _ in range(len(all_pose_files))
         ]
 
+        def _score_range(start: int, end: int, depth: int = 0) -> int:
+            """Scort [start, end) und halbiert bei OOM. Gibt Fehlzahl zurueck.
+
+            Vorher wurde ein fehlgeschlagener Batch nur geloggt und
+            verworfen: bei einem OOM mit 3950 Posen fehlten anschliessend
+            83 % der Scores, der Block wurde trotzdem als vollstaendig
+            gesichert und beim Neustart uebersprungen. Die Halbierung folgt
+            dem Muster aus unidock_engine._run_sub_batch.
+            """
+            files = all_pose_files[start:end]
+            if not files:
+                return 0
+            try:
+                batch_results = self._score_batch(protein_pdbqt, files)
+                # _score_batch gibt 1-basierte Indizes zurueck
+                for local_idx, scores in batch_results.items():
+                    all_results_flat[start + local_idx - 1] = scores
+                return 0
+            except Exception as exc:
+                oom = any(k in str(exc).lower() for k in
+                          ("out of memory", "cuda error", "cublas", "cudnn"))
+                if oom and len(files) > 1 and depth < 6:
+                    _log.warning("score_ligands_batch: OOM bei %d Posen – "
+                                 "halbiere (Ebene %d)", len(files), depth + 1)
+                    # Cache leeren, sonst bringt die Halbierung nichts:
+                    # der reservierte Block bleibt sonst belegt.
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    mid = start + len(files) // 2
+                    return (_score_range(start, mid, depth + 1)
+                            + _score_range(mid, end, depth + 1))
+                _log.warning("score_ligands_batch: Batch %d-%d endgueltig "
+                             "fehlgeschlagen (%d Posen): %s",
+                             start, end, len(files), exc)
+                return len(files)
+
         try:
+            _failed = 0
             for batch_start in range(0, len(all_pose_files), max_poses_per_batch):
                 batch_end = min(batch_start + max_poses_per_batch, len(all_pose_files))
-                batch_files = all_pose_files[batch_start:batch_end]
+                _failed += _score_range(batch_start, batch_end)
 
-                try:
-                    batch_results = self._score_batch(protein_pdbqt, batch_files)
-                    # _score_batch gibt 1-basierte Indizes zurueck
-                    for local_idx, scores in batch_results.items():
-                        global_idx = batch_start + local_idx - 1
-                        all_results_flat[global_idx] = scores
-                except Exception as exc:
-                    _log.warning("score_ligands_batch: Batch %d-%d fehlgeschlagen: %s",
-                                 batch_start, batch_end, exc)
+            if _failed:
+                _log.error("score_ligands_batch: %d von %d Posen ohne Score "
+                           "(%.1f %%)", _failed, len(all_pose_files),
+                           100.0 * _failed / max(1, len(all_pose_files)))
 
             # ── Phase 3: Ergebnisse auf Liganden zurückverteilen ──
             results: dict[str, dict[int, dict[str, Optional[float]]]] = {}
