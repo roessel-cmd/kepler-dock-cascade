@@ -186,6 +186,7 @@ class RescoringConfig:
     cluster_poses:       bool  = False  # Pose-Clustering vor Rescoring
     cluster_rmsd_cutoff: float = 2.0    # RMSD-Schwelle in Angstrom
     rescore_batch_size:  int   = 0      # 0 = auto (VRAM-basiert)
+    min_block_coverage:  float = 0.99   # Mindestabdeckung je Block
     # Blockgroesse fuer wiederaufnahmefaehiges Rescoring.
     # 0 = aus: alles in einem Durchgang wie bisher, kein Zwischenstand.
     rescore_block_size:  int   = 0
@@ -230,6 +231,7 @@ class RescoringConfig:
             cluster_poses       = p.getboolean(s, "cluster_poses",       fallback=False),
             cluster_rmsd_cutoff = p.getfloat(  s, "cluster_rmsd_cutoff", fallback=2.0),
             rescore_batch_size  = p.getint(    s, "rescore_batch_size",  fallback=0),
+            min_block_coverage  = p.getfloat(  s, "min_block_coverage",  fallback=0.99),
             rescore_block_size  = p.getint(    s, "rescore_block_size",  fallback=0),
             dense_enabled       = p.getboolean(s, "dense_enabled",       fallback=False),
             dense_model         = p.get(       s, "dense_model",         fallback="dense_ensemble"),
@@ -258,6 +260,23 @@ class RescoringConfig:
         pro Aufruf genau eine --scoring-Funktion auswertet.
         """
         return self.vinardo_enabled or self.ad4_enabled
+
+    @property
+    def primary_cnn_needed(self) -> bool:
+        """True, wenn ein Ausgang des Primaermodells ins Ranking eingeht."""
+        return self.cnnaffinity_enabled or self.cnnscore_enabled
+
+    @property
+    def dense_cnn_needed(self) -> bool:
+        """True, wenn das Dense-Modell gebraucht wird.
+
+        Eigene Property, damit das Rechnen derselben Bedingung folgt wie
+        das Zaehlen. Frueher entschied ueber das Rechnen allein, ob der
+        Scorer geladen werden konnte, ueber das Zaehlen dagegen das Flag –
+        mit dense_enabled=true und beiden crossdock-Flags auf false liefen
+        deshalb zwei Netze statt einem.
+        """
+        return self.dense_enabled
 
     @property
     def extra_empirical_functions(self) -> list[tuple[str, str]]:
@@ -1913,10 +1932,15 @@ def rescore_target(
         _gpu_failures = 0
 
         try:
-            _gpu_scorer = GninaGPUScorer(
-                gpu_id=_torch_gpu_id,
-                cnn_model=rescore_cfg.cnn_model,
-            )
+            if rescore_cfg.primary_cnn_needed:
+                _gpu_scorer = GninaGPUScorer(
+                    gpu_id=_torch_gpu_id,
+                    cnn_model=rescore_cfg.cnn_model,
+                )
+            else:
+                logger.info("  [%s] Primaermodell uebersprungen "
+                            "(cnnaffinity/cnnscore aus).", target.name)
+                _gpu_scorer = None
         except Exception as exc:
             logger.warning(
                 "  [%s] GninaGPUScorer Init fehlgeschlagen: %s – "
@@ -1926,7 +1950,10 @@ def rescore_target(
             _gpu_scorer = None
 
         # Dense-Scorer laden (optionales zweites Modell)
-        if _gpu_scorer is not None and rescore_cfg.dense_enabled:
+        # Nicht mehr an _gpu_scorer gekoppelt: sonst faellt Dense mit aus,
+        # sobald das Primaermodell abgeschaltet ist – genau der Fall
+        # "nur Dense-Affinity".
+        if rescore_cfg.dense_cnn_needed:
             try:
                 _dense_scorer = GninaGPUScorer(
                     gpu_id=_torch_gpu_id,
@@ -1942,7 +1969,7 @@ def rescore_target(
                 )
                 _dense_scorer = None
 
-        if _gpu_scorer is not None:
+        if _gpu_scorer is not None or _dense_scorer is not None:
             try:
                 # ── Modus-Auswahl: Multi-Ligand-Batch vs. Einzel-Ligand ──
                 # Multi-Ligand-Batching ist deutlich schneller, aber nur moeglich
@@ -1965,10 +1992,13 @@ def rescore_target(
 
                     if valid_docked:
                         # Batch-Scoring: Primaermodell
-                        batch_results = _gpu_scorer.score_ligands_batch(
-                            target.pdbqt_path,
-                            valid_docked,
-                            max_poses_per_batch=rescore_cfg.rescore_batch_size,
+                        batch_results = (
+                            _gpu_scorer.score_ligands_batch(
+                                target.pdbqt_path,
+                                valid_docked,
+                                max_poses_per_batch=rescore_cfg.rescore_batch_size,
+                            )
+                            if _gpu_scorer is not None else {}
                         )
 
                         # Batch-Scoring: Dense-Modell (wenn aktiv)
@@ -1984,13 +2014,24 @@ def rescore_target(
 
                         # Ergebnisse zusammenbauen
                         _lig_count = 0
-                        for ligand_name, gnina_map in batch_results.items():
+                        # Ohne Primaermodell ist batch_results leer – dann
+                        # muss die Iteration ueber die Dense-Ergebnisse gehen,
+                        # sonst wird still gar nichts zusammengebaut.
+                        _source = batch_results or dense_batch_results
+                        for ligand_name in _source:
+                            gnina_map = batch_results.get(ligand_name, {})
                             _lig_count += 1
                             vina_poses = vina_data.get(ligand_name, [])
                             dense_map = dense_batch_results.get(ligand_name, {})
 
-                            # CLI-Fallback fuer leere GPU-Ergebnisse
-                            if not gnina_map and _GNINA_OK:
+                            # CLI-Fallback fuer leere GPU-Ergebnisse.
+                            # Nur wenn das Primaermodell ueberhaupt laufen
+                            # sollte: ist es abgeschaltet, ist gnina_map fuer
+                            # JEDEN Liganden leer und der Fallback wuerde
+                            # einen gnina-Prozess pro Ligand starten – fuer
+                            # Werte, die gar nicht gebraucht werden.
+                            if (_gpu_scorer is not None
+                                    and not gnina_map and _GNINA_OK):
                                 _gpu_failures += 1
                                 docked_path = next(
                                     (d for d in valid_docked
@@ -2048,9 +2089,13 @@ def rescore_target(
                                 _temp_files.append(score_path)
 
                         # ── gninatorch GPU Rescoring (Primaermodell) ──
-                        gnina_map = _gpu_scorer.score_ligand(
-                            target.pdbqt_path, score_path,
-                        )
+                        # _gpu_scorer ist None, wenn cnnaffinity und cnnscore
+                        # beide aus sind – dann liefe hier ein AttributeError.
+                        gnina_map: dict = {}
+                        if _gpu_scorer is not None:
+                            gnina_map = _gpu_scorer.score_ligand(
+                                target.pdbqt_path, score_path,
+                            )
 
                         # ── Dense-Scoring (wenn aktiv) ──
                         dense_map: dict = {}
@@ -2059,8 +2104,12 @@ def rescore_target(
                                 target.pdbqt_path, score_path,
                             )
 
-                        # Fallback auf CLI wenn GPU-Scoring fehlschlaegt
-                        if not gnina_map and _GNINA_OK:
+                        # Fallback auf CLI wenn GPU-Scoring fehlschlaegt.
+                        # Nur bei aktivem Primaermodell – sonst waere
+                        # gnina_map immer leer und der Fallback liefe fuer
+                        # jeden Liganden als eigener Prozess.
+                        if (_gpu_scorer is not None
+                                and not gnina_map and _GNINA_OK):
                             _gpu_failures += 1
                             gnina_map = _score_gnina_ligand(
                                 score_path, target.pdbqt_path,
@@ -2090,7 +2139,8 @@ def rescore_target(
                     _scoring_done = True
 
             finally:
-                _gpu_scorer.close()
+                if _gpu_scorer is not None:
+                    _gpu_scorer.close()
                 if _dense_scorer is not None:
                     _dense_scorer.close()
 
@@ -2236,6 +2286,29 @@ def _partial_path(target_results_dir: Path, block_idx: int) -> Path:
             / f"scores_{block_idx:05d}.csv")
 
 
+def _active_keys_for_coverage(rescore_cfg) -> list[str]:
+    """ECR-Keys, die vollstaendig vorliegen muessen.
+
+    Nur die tatsaechlich berechneten. vina kommt aus dem PDBQT-Header und
+    fehlt hoechstens, wenn die Pose kaputt ist – das faengt check_poses.py
+    ab und ist kein Batch-Problem, deshalb hier ausgeklammert.
+    """
+    keys: list[str] = []
+    if rescore_cfg.cnnaffinity_enabled:
+        keys.append("cnnaffinity")
+    if rescore_cfg.cnnscore_enabled:
+        keys.append("cnnscore")
+    if rescore_cfg.dense_enabled:
+        keys.append("dense_cnnaffinity")
+    if rescore_cfg.vinardo_enabled:
+        keys.append("vinardo")
+    if rescore_cfg.ad4_enabled:
+        keys.append("ad4")
+    if rescore_cfg.deltalinf9xgb_enabled:
+        keys.append("deltalinf9xgb")
+    return keys
+
+
 def _write_partial(poses: list[PoseResult], path: Path) -> None:
     """
     Rohscores eines Blocks sichern – atomar ueber eine .tmp-Datei.
@@ -2345,6 +2418,37 @@ def rescore_target_blocked(
             logger.warning("  [%s] Block %d lieferte keine Posen.",
                            target.name, idx + 1)
             continue
+
+        # ── Abdeckungspruefung vor dem Sichern ──
+        # Ein Block, dem Scores fehlen, darf NICHT als erledigt gesichert
+        # werden: der Blockmodus ueberspringt ihn beim Neustart und der
+        # Verlust waere dauerhaft. Am 21.08.2026 wurde so ein Block mit
+        # 17 % Abdeckung gesichert (CUDA-OOM verwarf ganze Batches still).
+        # Posen ohne Wert bekommen in ecr.py keinen Rang und tragen 0 bei –
+        # sie werden also benachteiligt, nicht neutral behandelt.
+        _cov_problem = None
+        for _key in _active_keys_for_coverage(rescore_cfg):
+            _attr = ecr_mod.FIELDS[_key][0]
+            _have = sum(1 for _p in poses
+                        if getattr(_p, _attr, None) is not None)
+            _frac = _have / len(poses)
+            if _frac < rescore_cfg.min_block_coverage:
+                _cov_problem = (_key, _have, len(poses), _frac)
+                break
+
+        if _cov_problem:
+            _key, _have, _tot, _frac = _cov_problem
+            logger.error(
+                "  [%s] Block %d NICHT gesichert: nur %d von %d Posen haben "
+                "%s (%.1f %%, Minimum %.0f %%). Wahrscheinlich CUDA-OOM – "
+                "rescore_batch_size verkleinern.",
+                target.name, idx + 1, _have, _tot, _key,
+                100 * _frac, 100 * rescore_cfg.min_block_coverage)
+            raise RuntimeError(
+                f"Block {idx + 1} von {target.name} unvollstaendig: "
+                f"{_frac:.1%} Abdeckung bei '{_key}'. Abbruch, damit der "
+                f"Block beim naechsten Lauf neu gescort wird."
+            )
 
         _write_partial(poses, part)
         all_poses.extend(poses)
