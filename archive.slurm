@@ -3,27 +3,18 @@
 #   sbatch archive.slurm dock-76523
 #   sbatch archive.slurm 76523 --purge
 #   sbatch archive.slurm dock-76523 --no-poses --top 500
-#
-# Alles nach dem Skriptnamen wird an src/archive_run.sh durchgereicht.
-# Kein nohup noetig – der Job laeuft ohnehin im Hintergrund und ueberlebt
-# das Abmelden.
+
 
 #SBATCH --job-name=kdc-archive
 #SBATCH -N 1
 #SBATCH -p zen4_0768
+#SBATCH --qos zen4_0768
 #SBATCH --exclusive
 #SBATCH --time=08:00:00
 #SBATCH --mail-user=thomas.roessel@gmail.com
 #SBATCH --mail-type=END,FAIL
 #SBATCH --output=logs/archive-%j.out
 
-# Ganze Node: Tarren und Komprimieren sind CPU- und I/O-Arbeit, keine GPU.
-# Bei 2x AMD 9654 stehen damit 192 Kerne fuer pigz bereit.
-#
-# Acht Stunden sind grosszuegig. Mit pigz auf 192 Kernen ist auch ein
-# Target mit 2,29 Mio. Posen (~57 GB) in unter einer Stunde durch; ohne
-# pigz laeuft gzip einfaedig und braucht ein Vielfaches. Die Verifikation
-# entpackt das Archiv noch einmal vollstaendig, das kommt hinzu.
 
 set -uo pipefail
 
@@ -60,10 +51,6 @@ else
     log "             Abhilfe: --no-poses, oder pigz ins Modulsystem laden."
 fi
 
-# Freien Platz pruefen, bevor stundenlang gearbeitet wird. Ein Archiv, das
-# an der vollen Platte scheitert, kostet die gesamte Laufzeit – und mit
-# --purge wuerde es zwar nichts loeschen (die Verifikation faengt das ab),
-# aber der Job waere umsonst gewesen.
 NEED_KB=$(du -sk RESULTS data/LOG 2>/dev/null | awk '{s+=$1} END {print s}')
 FREE_KB=$(df -Pk "$PROJECT_DIR" | awk 'NR==2 {print $4}')
 log "Rohdaten   : $(( NEED_KB / 1024 / 1024 )) GB"
