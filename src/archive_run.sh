@@ -87,9 +87,8 @@ STAGE="$OUT_DIR/.stage_${JOB}"
 
 [ -e "$ARCHIVE" ] && die "$ARCHIVE existiert bereits."
 
-# Sperre: zwei gleichzeitige Laeufe schreiben in dasselbe Staging-
-# Verzeichnis und dasselbe Archiv. In Job 77159 startete srun das Skript
-# viermal; das Ergebnis war ein unlesbares Archiv. mkdir ist atomar.
+# Sperre gegen Parallellaeufe: sie wuerden in dasselbe Staging-
+# Verzeichnis und dasselbe Archiv schreiben. mkdir ist atomar.
 mkdir -p "$OUT_DIR" 2>/dev/null
 LOCK="$OUT_DIR/.lock_${JOB}"
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -108,9 +107,8 @@ mapfile -t TARGETS < <(find RESULTS -mindepth 1 -maxdepth 1 -type d \
 
 log "Targets    : ${TARGETS[*]}"
 
-# Groesse und Anzahl kosten bei Millionen Dateien Minuten (Job 77159:
-# zehn fuer ein einziges du). Nur erheben, wenn die Zahl auch gebraucht
-# wird – bei --no-poses wandern die Posen ohnehin nicht ins Archiv.
+# Zaehlen kostet bei Millionen Dateien Minuten. Nur erheben, wenn die
+# Zahl gebraucht wird.
 if [ "$WITH_POSES" = true ]; then
     log "Zaehle Posen (dauert bei Millionen Dateien einige Minuten) ..."
     N_POSEN=$(find RESULTS -name '*_docked.pdbqt' | wc -l)
@@ -150,9 +148,6 @@ mkdir -p "$STAGE/$JOB"/{TARGET,slurm}
 log "── Sammle Metadaten ──"
 
 if [ -f TARGET/config.txt ]; then
-    # Fehler NICHT nach /dev/null: in Job 77159 meldete das Skript
-    # "config.txt fehlt", obwohl die Datei da war – gescheitert war das
-    # cp aus einem anderen Grund, und die Ursache blieb unsichtbar.
     cp -a TARGET/config.txt "$STAGE/$JOB/TARGET/" \
         || die "TARGET/config.txt nicht kopierbar."
 else
@@ -173,12 +168,9 @@ for f in logs/*"${JOBID}"*.out logs/*"${JOBID}"*.err; do
 done
 log "Slurm-Logs : $found_logs Datei(en)"
 
-# Worker-Logs: NICHT kopieren, sondern spaeter direkt in den Tarball
-# schreiben. Bei 8030 Dateien war der Kopiervorgang unnoetige Arbeit.
-#
-# Stufe 1 (Konvertierung) hinterlaesst pro fehlgeschlagenem Molekuel eine
-# *_convert_error.log. Die gehoeren nicht zu diesem Lauf und machten in
-# Job 77159 den Grossteil der 8030 Dateien aus. --all-logs behaelt sie.
+# Nicht kopieren, sondern spaeter direkt in den Tarball schreiben.
+# Stufe 1 hinterlaesst pro fehlgeschlagenem Molekuel eine
+# *_convert_error.log; die gehoeren nicht zu diesem Lauf.
 LOG_EXCLUDE=()
 if [ -d data/LOG ]; then
     n_all=$(find data/LOG -type f | wc -l)
@@ -187,7 +179,6 @@ if [ -d data/LOG ]; then
     if [ "$ALL_LOGS" = true ]; then
         log "Worker-Logs: $n_all Datei(en), inkl. $n_conv aus der Konvertierung"
     else
-        # Zwei Muster: die Einzelfehler pro Molekuel und die Sammeldatei.
         LOG_EXCLUDE=(--exclude=*_convert_error.log --exclude=conversion.log)
         log "Worker-Logs: $(( n_all - n_conv )) Datei(en)"
         [ "$n_conv" -gt 0 ] && \
@@ -209,8 +200,7 @@ for t in "${TARGETS[@]}"; do
     cp -a "$src" "$STAGE/$JOB/"
     n_rank=$((n_rank+1))
 
-    # Top-N: die Datei ist bereits nach ecr_rank sortiert, aber darauf
-    # verlassen wir uns nicht – lieber explizit nach ecr_score sortieren.
+    # Explizit nach ecr_score sortieren, nicht auf ecr_rank verlassen.
     python3 - "$src" "$STAGE/$JOB/Top${TOP_N}_${t}.csv" "$TOP_N" <<'PY'
 import csv, sys
 src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -230,7 +220,6 @@ print(f"  Top{n}: {min(n, len(rows))} von {len(rows):,} Liganden")
 PY
 done
 if [ "$n_rank" -eq 0 ]; then
-    # Kein Fehler: ein reines Docking-Archiv ist ein gueltiges Ergebnis.
     log "Kein Rescoring vorhanden – Archiv enthaelt nur Docking-Ergebnisse."
 else
     log "Rankings   : $n_rank Target(s)"
@@ -255,8 +244,6 @@ fi
     done
 } > "$STAGE/$JOB/MANIFEST.txt"
 
-# Konfigurationsdateien selbst mit hinein – der Kommentarapparat ist Teil
-# der Dokumentation des Laufs.
 mkdir -p "$STAGE/$JOB/config"
 cp -a config/*.ini "$STAGE/$JOB/config/" 2>/dev/null || true
 
@@ -265,12 +252,12 @@ log "── Archiv bauen ──"
 mkdir -p "$OUT_DIR"
 START=$(date +%s)
 
-# RESULTS wird NICHT kopiert, sondern direkt aus dem Original in den
-# Tarball geschrieben und dabei unter <jobname>/RESULTS einsortiert.
+# RESULTS wird nicht kopiert, sondern per --transform direkt aus dem
+# Original unter <jobname>/RESULTS einsortiert.
 if [ "$WITH_POSES" = true ]; then
     RESULTS_ARGS=(-C "$PROJECT" RESULTS)
 else
-    # Nur CSVs: Dateiliste vorbereiten, sonst wird die Kommandozeile zu lang.
+    # Dateiliste statt Argumenten, sonst wird die Kommandozeile zu lang.
     find RESULTS -maxdepth 2 -name '*.csv' -not -path '*/.rescore_partial/*' \
         > "$STAGE/results_files.txt"
     log "Ohne Posen : $(wc -l < "$STAGE/results_files.txt") CSV-Datei(en)"
@@ -280,8 +267,6 @@ fi
 LOG_ARGS=()
 [ -d data/LOG ] && LOG_ARGS=(-C "$PROJECT/data" LOG)
 
-# --transform wirkt auf jeden Eintrag; die Staging-Eintraege beginnen mit
-# "$JOB/" und werden von beiden Ausdruecken nicht getroffen.
 tar --use-compress-program="$COMPRESS" \
     --transform "s|^RESULTS|$JOB/RESULTS|" \
     --transform "s|^LOG|$JOB/LOG|" \
@@ -300,18 +285,15 @@ log "Archiv     : $ARCHIVE ($SZ, ${DT}s)"
 # Ohne diesen Schritt wuerde --purge Daten loeschen, deren Archiv
 # moeglicherweise abgeschnitten ist (volle Platte, Timeout, Signal).
 log "── Verifikation ──"
-# Genau EINMAL auflisten: bei einem 50-GB-Archiv ist jeder Durchlauf ein
-# vollstaendiges Entpacken. Das Ergebnis wandert in eine Datei, gegen die
-# dann geprueft wird.
+# Genau einmal auflisten: jeder Durchlauf entpackt das ganze Archiv.
 LIST="$STAGE/archive_list.txt"
 tar --use-compress-program="$COMPRESS" -tf "$ARCHIVE" > "$LIST" \
     || die "Archiv nicht lesbar – NICHTS wird geloescht."
 N_ENTRIES=$(wc -l < "$LIST")
 log "Eintraege  : $N_ENTRIES"
 
-# grep -q beendet sich beim ersten Treffer; in einer Pipeline mit tar
-# haette das unter 'set -o pipefail' SIGPIPE ausgeloest und die Pruefung
-# waere fehlgeschlagen, obwohl die Datei vorhanden ist.
+# Gegen die Datei pruefen, nicht per Pipe: grep -q loest sonst SIGPIPE
+# aus und die Pruefung scheitert unter pipefail trotz vorhandener Datei.
 for must in "$JOB/MANIFEST.txt" "$JOB/TARGET/config.txt"; do
     grep -qxF "$must" "$LIST" || die "$must fehlt im Archiv."
 done
@@ -328,18 +310,46 @@ fi
 log "── Aufraeumen ──"
 STAMP=$(date '+%Y%m%d_%H%M%S')
 
-# Erst verschieben, dann im Hintergrund loeschen: das Umbenennen ist
-# sofort fertig, die Pipeline kann direkt wieder schreiben, und das
-# eigentliche Loeschen von Millionen Dateien laeuft nebenher.
+# Erst verschieben: sofort fertig, die Pipeline kann wieder schreiben.
+MOVED=()
 for d in RESULTS data/LOG; do
     [ -d "$d" ] || continue
     old="${d}.old_${STAMP}"
     mv "$d" "$old" || { log "WARNUNG: $d nicht verschiebbar."; continue; }
     mkdir -p "$d"
-    log "$d -> $old (wird im Hintergrund geloescht)"
-    setsid nohup rm -rf "$old" > /dev/null 2>&1 &
+    log "$d -> $old"
+    MOVED+=("$old")
 done
 
+if [ ${#MOVED[@]} -eq 0 ]; then
+    log "Nichts zu loeschen."
+    log "Fertig. Archiv: $ARCHIVE"
+    exit 0
+fi
+
+# Eigener Job statt Hintergrundprozess: aus einem Slurm-Job heraus
+# ueberlebt ein nohup-rm das Jobende nicht. Keine --dependency noetig,
+# diese Stelle wird nur nach erfolgreicher Verifikation erreicht.
+if command -v sbatch >/dev/null 2>&1 && [ -f "$PROJECT/cleanup.slurm" ]; then
+    CLEAN_JOB=$(sbatch --parsable "$PROJECT/cleanup.slurm" "${MOVED[@]}" 2>&1)
+    if [[ "$CLEAN_JOB" =~ ^[0-9]+$ ]]; then
+        log "Loeschjob   : $CLEAN_JOB  (${MOVED[*]})"
+    else
+        log "WARNUNG: Loeschjob nicht eingereicht: $CLEAN_JOB"
+        log "         Von Hand:  sbatch cleanup.slurm ${MOVED[*]}"
+    fi
+else
+    # Von der Login-Shell aus ueberlebt nohup.
+    log "Kein sbatch/cleanup.slurm – loesche im Hintergrund."
+    mkdir -p logs
+    for old in "${MOVED[@]}"; do
+        # Nach logs/, sonst passt die Logdatei selbst auf *.old_*.
+        rmlog="logs/rm_$(basename "$old").log"
+        nohup rm -r "$old" > "$rmlog" 2>&1 &
+        log "  rm -r $old (PID $!, Log: $rmlog)"
+    done
+    log "Fortschritt: ps -u \$USER -o pid,etime,cmd | grep '[r]m -r'"
+fi
+
 log "Fertig. Archiv: $ARCHIVE"
-log "Loeschvorgaenge laufen im Hintergrund – mit 'du -sh *.old_*' pruefbar."
 exit 0
