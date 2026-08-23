@@ -575,23 +575,6 @@ The wall-clock path demands progress as well: if one unit takes longer than the
 wall clock — a `rescore_block_size` set too large — no run ever saves anything,
 and the chain would otherwise spin through all `CHAIN_MAX` links doing nothing.
 
-### rescore_test.slurm
-
-Runs stage 3 on a bounded slice of one target, for checking a configuration
-change before committing hours of GPU time to it. It builds a sandbox target
-from symlinks, runs the rescoring worker against it, then reports which score
-columns actually got filled and removes the sandbox again.
-
-```bash
-sbatch rescore_test.slurm                                     # default target, 400 ligands
-sbatch --export=ALL,TEST_TARGET=BRD4,MAX_LIGANDS=5000 rescore_test.slurm
-sbatch --export=ALL,TEST_TARGET=BRD4,KEEP_SANDBOX=true rescore_test.slurm
-```
-
-The column report is the point of it. A configuration that runs the wrong model,
-or none, produces a plausible-looking CSV; the check states plainly which of
-`score_vina`, `score_cnnaffinity` and `score_dense_cnnaffinity` carry values.
-
 ### benchmark.slurm
 
 Runs the benchmark matrix as a single job — deliberately without chaining, since
