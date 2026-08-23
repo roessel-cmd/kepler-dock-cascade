@@ -110,24 +110,12 @@ cp ../src/{worker_rescore.py,docking_rescore.py,gnina_refinement.py} .
 cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py,ecr.py} .
 apptainer build ../rescoring-gpu.sif rescoring-gpu.def
 ```
-Build the three containers (with -fakeroot):
+
+On sites where the `fakeroot` command is present but unusable — a common setup
+on shared clusters — add `--ignore-fakeroot-command` to each `apptainer build`:
 
 ```bash
-cd build/
-
-# Stage 1
-cp ../src/sdf_to_pdbqt.py .
-apptainer build --ignore-fakeroot-command ../sdf_to_pdbqt.sif sdf_to_pdbqt.def
-
-# Stage 2
-cp ../src/{pipeline_common.py,docking_config.py,unidock_engine.py} .
-cp ../src/{worker_dock.py,worker_restart_dock.py} .
 apptainer build --ignore-fakeroot-command ../unidock-gpu.sif unidock-gpu.def
-
-# Stage 3 — gnina muss bereits in build/ liegen
-cp ../src/{worker_rescore.py,docking_rescore.py,gnina_refinement.py} .
-cp ../src/{gnina_gpu_worker.py,linf9xgb_scorer.py,ecr.py} .
-apptainer build --ignore-fakeroot-command ../rescoring-gpu.sif rescoring-gpu.def
 ```
 
 Apptainer resolves `%files` relative to the working directory, so the modules
@@ -198,6 +186,21 @@ RUN_RESCORING=true
 Re-ranking with different consensus weights needs no re-docking: set
 `RUN_CONVERSION=false` and `RUN_DOCKING=false`, adjust the `w_*` values in
 `config/rescore.ini`, run again.
+
+Changing only the weights does not even need the scoring to run again. With
+`rescore_block_size > 0` the raw scores are kept in
+`RESULTS/<target>/.rescore_partial/`, and `rescore_rank.py` recomputes the
+ranking from them on the host — no container, no GPU, seconds instead of hours:
+
+```bash
+python3 src/rescore_rank.py RESULTS/BRD4
+python3 src/rescore_rank.py RESULTS/BRD4 --weights vina=0.2,cnnscore=0.5,cnnaffinity=0.3
+python3 src/rescore_rank.py RESULTS/BRD4 --sigma-fraction 20 --out ranking_sharp.csv
+```
+
+Each output carries a comment header with the weights, `sigma`, the active
+functions and the git revision, so two rankings from two weightings stay
+distinguishable later.
 
 To resume an interrupted docking run:
 
@@ -319,6 +322,23 @@ rescoring runs on a single GPU.
 `vina_enabled` reads the value the docking used. With `[UNIDOCK] scoring = vinardo`
 the column `score_vina` holds Vinardo values; `check_config.py` warns about this.
 
+**The CNN switches gate the computation, not just the ranking.** Each of
+`cnn_model` and `dense_model` is one forward pass over every pose, and one model
+always produces both of its outputs — affinity and score — at the cost of one.
+Which of them enters the ranking is decided by the weights, not by these
+switches:
+
+| `cnnaffinity` / `cnnscore` | `dense_enabled` | Models run |
+|---|---|---|
+| either `true` | `false` | primary only |
+| both `false` | `true` | dense only |
+| either `true` | `true` | both — twice the GPU time |
+| both `false` | `false` | none |
+
+Before August 2026 the primary model ran unconditionally and these flags only
+controlled whether its values were counted, so `dense_enabled = true` with both
+primary flags off ran two models instead of one.
+
 **`[RESCORE]`, consensus weights.** All zero means equal weighting over the
 active functions. Otherwise weights normalise to 1 over the active set.
 
@@ -344,14 +364,31 @@ active functions. Otherwise weights normalise to 1 over the active set.
 | `gnina_binary` | *(empty)* | Path to gnina. Empty falls back to autodetection via PATH |
 | `gnina_use_gpu` | `true` | `false` forces `--no_gpu` |
 | `n_jobs` | `1` | joblib workers for the CLI path. `-1` uses all cores |
-| `rescore_batch_size` | `0` | Poses per GPU batch. `0` derives it from available VRAM |
+| `rescore_batch_size` | `0` | Poses per GPU batch. `0` derives it from available VRAM. On out-of-memory the batch is halved and retried, so an oversized value costs time rather than data |
 | `rescore_block_size` | `0` | Ligands per resumable block. `0` disables blocking. See below |
+| `min_block_coverage` | `0.99` | Fraction of a block's poses that must carry a score before the block is saved. Below it the run aborts instead of writing a block with gaps |
 | `cluster_poses` | `false` | RMSD clustering before scoring, reduces the number of poses |
 | `cluster_rmsd_cutoff` | `2.0` | Ångström threshold for clustering |
 | `deltalinf9xgb_n_workers` | `1` | Scoring workers for ΔLin_F9XGB |
 | `deltalinf9xgb_prep_workers` | `0` | MOL2 preparation workers. `0` mirrors `n_workers` |
 | `rescore_num_gpus` | `0` | GPUs for rescoring. `0` uses the `[GPU]` setting |
 | `rescore_cuda_device_id` | `0` | Which GPU when `rescore_num_gpus = 1` |
+
+**Resumable rescoring.** With `rescore_block_size > 0` the ligand list is cut
+into blocks. Each block is scored in full and written to
+`RESULTS/<target>/.rescore_partial/scores_NNNNN.csv` before the next one starts;
+a restart skips the blocks already on disk. Without it, a target killed at the
+wall clock starts over from the beginning. For HPC runs 2000 is a reasonable
+value — the model is reloaded once per block, which is negligible at that size.
+
+`min_block_coverage` guards the same mechanism from the other side. A block that
+is missing scores must not be saved: the resume logic would skip it and the loss
+would be permanent. Poses without a value receive no rank in the consensus and
+contribute zero, so they are penalised rather than treated as neutral — an
+incomplete block silently distorts the ranking.
+
+The partial files are also what `rescore_rank.py` reads, so they are worth
+keeping after a run finishes.
 
 **`[REFINEMENT]`.** Runs after rescoring on the best-ranked ligands.
 
@@ -369,19 +406,100 @@ active functions. Otherwise weights normalise to 1 over the active set.
 
 ## Running on an HPC cluster
 
-Three Slurm job scripts, submitted from the project root:
+Slurm job scripts, all submitted from the project root:
 
 ```bash
 sbatch convert.slurm      # stage 1, CPU only, once per library
-sbatch dock.slurm         # stage 2, chains itself past the wall-clock limit
+sbatch dock.slurm         # stage 2 or 3, chains itself past the wall-clock limit
 sbatch benchmark.slurm    # throughput measurements, single job
+sbatch rescore_test.slurm <target>          # stage 3 on a bounded slice
+sbatch archive.slurm <job> [--purge]        # bundle a finished run, then clean up
+sbatch cleanup.slurm <dir>.old_<timestamp>  # delete a moved directory
 ```
 
 Adjust the `#SBATCH` headers to your site: partition names, core counts and
-wall-clock limits differ between clusters. All three abort with a clear message
-if submitted from anywhere but the project root, since Slurm runs a copy of the
-script from its spool directory and only `SLURM_SUBMIT_DIR` points back to the
-repository.
+wall-clock limits differ between clusters. All of them abort with a clear
+message if submitted from anywhere but the project root, since Slurm runs a copy
+of the script from its spool directory and only `SLURM_SUBMIT_DIR` points back
+to the repository.
+
+### A full run, start to finish
+
+The stages are separate jobs on purpose: conversion needs no GPU, docking and
+rescoring have different wall-clock behaviour, and each of them is worth
+checking before the next one starts.
+
+**1. Prepare the library** — once per library, on a CPU partition.
+
+```bash
+sbatch convert.slurm
+```
+
+Wait for it to finish, then confirm the count is what you expect:
+
+```bash
+find data/PDBQT -name '*.pdbqt' | wc -l
+python3 src/check_ligands.py data/PDBQT
+```
+
+**2. Dock** — the chain runs until nothing is left.
+
+```bash
+sbatch dock.slurm
+squeue -u $USER            # the current link and its pending successor
+```
+
+Each link submits its successor before starting work, so the chain survives
+being killed at the wall clock. Check progress at any time, including while a
+link is running:
+
+```bash
+python3 src/pipeline_progress.py config/docking.ini
+```
+
+Exit code 1 means the docking is done. If the run was cut short by a node crash
+rather than by the scheduler, check for truncated poses before resuming:
+
+```bash
+python3 src/check_poses.py config/docking.ini --since 6
+```
+
+**3. Rescore** — same script, different stage switches.
+
+```bash
+sbatch --export=ALL,RUN_DOCKING=false,RUN_RESCORING=true dock.slurm
+```
+
+Set `rescore_block_size` to a non-zero value in `config/rescore.ini` first,
+otherwise nothing is checkpointed and a target interrupted at the wall clock
+starts over. Before committing a full target, a bounded slice confirms the
+configuration does what you think:
+
+```bash
+sbatch rescore_test.slurm
+python3 src/rescore_progress.py config/rescore.ini
+```
+
+**4. Re-rank** — on the host, no job needed.
+
+```bash
+python3 src/rescore_rank.py RESULTS/<target> --weights vina=0.5,cnnscore=0.5
+```
+
+**5. Archive and clean up.**
+
+```bash
+sbatch archive.slurm dock-76523 --dry-run
+sbatch archive.slurm dock-76523 --purge
+```
+
+The archive job submits the deletion job itself once the tarball verifies, so
+this step needs no further attention.
+
+A pattern worth keeping: each stage has a counter that answers "is this done?"
+without reading logs — `pipeline_progress.py` for docking, `rescore_progress.py`
+for rescoring. Both exit 1 when there is nothing left, which is also how
+`dock.slurm` decides to stop chaining.
 
 ### convert.slurm
 
@@ -422,6 +540,58 @@ squeue -u $USER                            # see the pending successor
 scancel <job-id>                           # cancelling a link stops the chain
 ```
 
+**The same script chains stage 3.** With `RUN_DOCKING=false` and
+`RUN_RESCORING=true` it drives the rescoring instead:
+
+```bash
+sbatch --export=ALL,RUN_DOCKING=false,RUN_RESCORING=true dock.slurm
+```
+
+The stage switches are passed on to the successor, so a rescoring chain does not
+turn back into a docking chain. The progress counter changes with the stage,
+because the two produce different artefacts: docking writes one file per ligand,
+rescoring writes one block file per few thousand. Running the docking counter
+against a finished docking would report "nothing left" and end the chain before
+stage 3 ever starts.
+
+| Stage | Counter | Unit | `MIN_PROGRESS` default |
+|---|---|---|---|
+| docking | `pipeline_progress.py` | ligands | 1000 |
+| rescoring | `rescore_progress.py` | blocks | 1 |
+
+Both share the same contract — exit 0 for work remaining, 1 for finished, 2 for
+an error, and `--json` carrying a `remaining` key — so the chain logic treats
+them identically. `rescore_progress.py` reads `config/rescore.ini`, counts the
+expected blocks from the pose files and the saved ones from
+`.rescore_partial/`, and refuses to count at all when the saved blocks do not
+match the configured block size:
+
+```bash
+python3 src/rescore_progress.py config/rescore.ini
+python3 src/rescore_progress.py config/rescore.ini --json
+```
+
+The wall-clock path demands progress as well: if one unit takes longer than the
+wall clock — a `rescore_block_size` set too large — no run ever saves anything,
+and the chain would otherwise spin through all `CHAIN_MAX` links doing nothing.
+
+### rescore_test.slurm
+
+Runs stage 3 on a bounded slice of one target, for checking a configuration
+change before committing hours of GPU time to it. It builds a sandbox target
+from symlinks, runs the rescoring worker against it, then reports which score
+columns actually got filled and removes the sandbox again.
+
+```bash
+sbatch rescore_test.slurm                                     # default target, 400 ligands
+sbatch --export=ALL,TEST_TARGET=BRD4,MAX_LIGANDS=5000 rescore_test.slurm
+sbatch --export=ALL,TEST_TARGET=BRD4,KEEP_SANDBOX=true rescore_test.slurm
+```
+
+The column report is the point of it. A configuration that runs the wrong model,
+or none, produces a plausible-looking CSV; the check states plainly which of
+`score_vina`, `score_cnnaffinity` and `score_dense_cnnaffinity` carry values.
+
 ### benchmark.slurm
 
 Runs the benchmark matrix as a single job — deliberately without chaining, since
@@ -459,6 +629,111 @@ LIGAND_SUBDIR = cdk2_dude
 
 Lines starting with `#` are comments. A receptor whose PDBQT is missing produces
 a warning and is skipped rather than aborting the run.
+
+## Archiving and cleanup
+
+A finished run leaves millions of files behind. `archive_run.sh` bundles what is
+worth keeping into one tarball and then clears the working directories.
+
+```bash
+sbatch archive.slurm dock-76523 --dry-run   # show what would happen
+sbatch archive.slurm dock-76523             # archive only
+sbatch archive.slurm dock-76523 --purge     # archive, then clean up
+```
+
+The job name resolves from `dock-76523`, from the bare id `76523`, or from a
+path like `logs/dock-76523.out`. `archive/<jobname>.tar.gz` then contains:
+
+```
+<jobname>/
+├── TARGET/            receptor PDBQTs and config.txt
+├── config/            the INIs the run used
+├── slurm/             the .out files of that job id
+├── LOG/               worker and chunk logs from data/LOG
+├── RESULTS/           poses and CSVs
+├── rescoring_ligands_<target>.csv
+├── Top<N>_<target>.csv
+└── MANIFEST.txt       date, host, targets, active configuration
+```
+
+| Option | Effect |
+|---|---|
+| `--purge` | Move `RESULTS/` and `data/LOG/` aside and delete them afterwards |
+| `--no-poses` | Keep only the CSVs from `RESULTS/`, not the `_docked.pdbqt` files |
+| `--all-logs` | Include the stage 1 conversion logs, which are excluded by default |
+| `--top N` | Size of the top list, default 250 |
+| `--out DIR` | Target directory for the archive, default `archive/` |
+| `--dry-run` | Report only, change nothing |
+
+Conversion logs are left out because stage 1 writes one file per failed molecule
+and they belong to the library, not to this run. Docking and rescoring artefacts
+are kept.
+
+`MANIFEST.txt` records the configuration the run actually used. Column names
+carry only part of that: `score_vina` holds Vinardo values when the docking used
+Vinardo, and the weights behind an `ecr_score` are not visible in the CSV at all.
+Rankings produced by `rescore_rank.py` carry the same information as a comment
+header, which `pandas.read_csv(comment='#')` and `csv.DictReader` both skip.
+
+**Nothing is deleted before the archive verifies.** The tar listing has to
+complete and contain the required entries; an archive truncated by a full disk
+or a wall-clock kill blocks the cleanup. `--no-poses --purge` is the one
+combination that removes data which is provably not in the archive — use it only
+when the poses are genuinely disposable.
+
+The deletion runs as its own job. A background `rm` started from inside a Slurm
+job does not survive the job ending: Slurm reaps the job step's processes,
+`setsid` and `nohup` notwithstanding. `cleanup.slurm` only removes paths
+matching `*.old_<timestamp>`, so a stray argument cannot take out `RESULTS` or
+`TARGET`.
+
+### Manual cleanup
+
+For clearing a directory without archiving. Rename first, recreate the empty
+directory immediately, send the deletion to the background — the pipeline can
+write again straight away, while `rm` works through the file count.
+
+**All commands assume the project root as the working directory.** Run from
+elsewhere they fail with `No such file or directory`, which here means nothing
+was deleted rather than that the work is done.
+
+```bash
+cd /path/to/kepler-dock-cascade
+
+mv RESULTS RESULTS.old && mkdir RESULTS
+nohup rm -r RESULTS.old > ~/rm_results.log 2>&1 &
+
+mv data/LOG data/LOG.old && mkdir data/LOG
+nohup rm -r data/LOG.old > ~/rm_log.log 2>&1 &
+
+mv data/PDBQT data/PDBQT.old && mkdir data/PDBQT
+nohup rm -r data/PDBQT.old > ~/rm_pdbqt.log 2>&1 &
+```
+
+`data/PDBQT` holds the docking input. Only clear it once every target has
+finished docking, or stage 1 has to run again over the whole library.
+
+Checking progress:
+
+```bash
+ps -u $USER -o pid,etime,cmd | grep '[r]m -r'   # deletions still running?
+ps -u $USER -o pid,etime,cmd                    # everything of yours on this node
+squeue -u $USER                                 # your Slurm jobs, any node
+find RESULTS.old -type f 2>/dev/null | wc -l    # how much is left
+cat ~/rm_results.log                            # errors, should be empty
+```
+
+`ps` only sees the node you are logged into; anything running as a Slurm job
+lives on a compute node and shows up in `squeue`. `jobs` works only in the shell
+that started the process. Avoid `du` here — it reports errors for files `rm`
+removes while it counts, which looks alarming and is not.
+
+`-r` rather than `-rf`: `-f` suppresses error messages, and across millions of
+files permission or I/O problems are worth seeing.
+
+---
+
+---
 
 ## Consensus ranking
 
@@ -581,6 +856,22 @@ python3 src/check_config.py  config/
 python3 src/check_ligands.py data/PDBQT
 ```
 
+A third script for the case where a docking run was cut short by a crash rather
+than by the scheduler:
+
+```bash
+python3 src/check_poses.py config/docking.ini --since 6
+python3 src/check_poses.py config/docking.ini --since 6 --quarantine data/BROKEN
+```
+
+`restart_orchestrator.py` accepts any `_docked.pdbqt` with a non-zero size, so a
+pose truncated mid-write counts as finished and is never re-docked. The failure
+surfaces hours later, when gnina cannot parse it. `check_poses.py` verifies that
+each file carries a `REMARK VINA RESULT` and ends on `ENDMDL`, reading only the
+head and tail of each file. It reports by default; `--delete` or `--quarantine`
+removes the broken ones so the restart picks them up again. `--since N` limits
+the scan to files younger than N hours — the only ones a crash can have damaged.
+
 `check_ligands.py` covers a failure mode that produces no error message: the
 converter derives filenames from SDF titles, so two molecules with the same
 title get the same filename. Docking results are written flat per target, so
@@ -611,6 +902,14 @@ This section will be updated once those numbers exist.
 - `parse_target_config` exists twice: in `pipeline_common.py` and as a standalone
   copy inside `docking_rescore.py`. Changes to the `config.txt` format have to be
   made in both.
+- `min_block_coverage` is checked when a block is written, not when a saved
+  block is read back. Partial files produced before that check existed are
+  taken at face value on resume; clear `.rescore_partial/` if in doubt.
+- The rescoring log line `gninatorch GPU-Rescoring aktiv: <cnn_model>` always
+  names the primary model, even when only the dense model runs. The lines that
+  follow it are correct.
+- Open Babel emits a kekulisation warning per pose when reading PDBQT, which has
+  no bond orders. Harmless, but it dominates the logs at library scale.
 - No automated test suite.
 
 ---
@@ -621,8 +920,11 @@ This section will be updated once those numbers exist.
 ├── pipeline_start.sh          Stage toggles, runs the three stages
 ├── benchmark.sh               Throughput measurements (GPU scaling, batch sweep)
 ├── convert.slurm              HPC: stage 1 on a CPU partition
-├── dock.slurm                 HPC: stage 2, self-chaining past the wall clock
+├── dock.slurm                 HPC: stage 2 or 3, self-chaining past the wall clock
 ├── benchmark.slurm            HPC: benchmark matrix as one job
+├── rescore_test.slurm         HPC: stage 3 on a bounded slice of one target
+├── archive.slurm              HPC: bundle a finished run, optionally clean up
+├── cleanup.slurm              HPC: delete a moved *.old_<timestamp> directory
 │
 ├── config/
 │   ├── docking.ini            Stage 2
@@ -649,7 +951,10 @@ This section will be updated once those numbers exist.
 │   │
 │   ├── check_config.py        Pre-flight: INI consistency
 │   ├── check_ligands.py       Pre-flight: library layout and name collisions
+│   ├── check_poses.py         Pre-flight: truncated poses after a crash
 │   ├── pipeline_progress.py   Remaining docking work; stop condition for dock.slurm
+│   ├── rescore_progress.py    Remaining rescoring work, counted in blocks
+│   ├── archive_run.sh         Bundle a finished run, then clear the directories
 │   └── rescore_rank.py        Re-rank from stored scores, no container needed
 │
 ├── build/
