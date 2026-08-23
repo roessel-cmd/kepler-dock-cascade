@@ -24,6 +24,7 @@ JOB=""
 PURGE=false
 DRY=false
 WITH_POSES=true
+ALL_LOGS=false
 TOP_N=250
 OUT_DIR=""
 
@@ -35,6 +36,7 @@ Optionen:
   --purge         RESULTS/ und data/LOG/ nach der Verifikation loeschen
   --no-poses      nur CSVs aus RESULTS/, keine _docked.pdbqt
   --top N         Groesse der Top-Liste (default 250)
+  --all-logs      auch Konvertierungs-Logs aus Stufe 1 mitnehmen
   --out DIR       Zielverzeichnis fuer das Archiv (default ./archive)
   --dry-run       nur zeigen, was passieren wuerde
 EOF
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --purge)    PURGE=true ;;
         --no-poses) WITH_POSES=false ;;
+        --all-logs) ALL_LOGS=true ;;
         --top)      TOP_N="$2"; shift ;;
         --out)      OUT_DIR="$2"; shift ;;
         --dry-run)  DRY=true ;;
@@ -84,6 +87,17 @@ STAGE="$OUT_DIR/.stage_${JOB}"
 
 [ -e "$ARCHIVE" ] && die "$ARCHIVE existiert bereits."
 
+# Sperre: zwei gleichzeitige Laeufe schreiben in dasselbe Staging-
+# Verzeichnis und dasselbe Archiv. In Job 77159 startete srun das Skript
+# viermal; das Ergebnis war ein unlesbares Archiv. mkdir ist atomar.
+mkdir -p "$OUT_DIR" 2>/dev/null
+LOCK="$OUT_DIR/.lock_${JOB}"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    die "Ein Lauf fuer $JOB ist bereits aktiv ($LOCK). Falls das ein Rest
+       eines abgebrochenen Laufs ist: rmdir '$LOCK'"
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
 # ── Bestandsaufnahme ──────────────────────────────────────────────────
 [ -d RESULTS ] || die "RESULTS/ fehlt."
 [ -d TARGET ]  || die "TARGET/ fehlt."
@@ -94,16 +108,22 @@ mapfile -t TARGETS < <(find RESULTS -mindepth 1 -maxdepth 1 -type d \
 
 log "Targets    : ${TARGETS[*]}"
 
-N_POSEN=$(find RESULTS -name '*_docked.pdbqt' | wc -l)
-SZ_RESULTS=$(du -sh RESULTS 2>/dev/null | cut -f1)
-SZ_LOG=$(du -sh data/LOG 2>/dev/null | cut -f1)
-log "RESULTS    : $SZ_RESULTS ($N_POSEN Posendateien)"
-log "data/LOG   : ${SZ_LOG:-fehlt}"
-
-if [ "$WITH_POSES" = true ] && [ "$N_POSEN" -gt 500000 ]; then
-    log "HINWEIS: $N_POSEN Posendateien werden mitarchiviert. Das dauert"
-    log "         lange und erzeugt ein sehr grosses Archiv. Mit --no-poses"
-    log "         landen nur die CSVs im Tarball."
+# Groesse und Anzahl kosten bei Millionen Dateien Minuten (Job 77159:
+# zehn fuer ein einziges du). Nur erheben, wenn die Zahl auch gebraucht
+# wird – bei --no-poses wandern die Posen ohnehin nicht ins Archiv.
+if [ "$WITH_POSES" = true ]; then
+    log "Zaehle Posen (dauert bei Millionen Dateien einige Minuten) ..."
+    N_POSEN=$(find RESULTS -name '*_docked.pdbqt' | wc -l)
+    SZ_RESULTS=$(du -sh RESULTS 2>/dev/null | cut -f1)
+    log "RESULTS    : $SZ_RESULTS ($N_POSEN Posendateien)"
+    if [ "$N_POSEN" -gt 500000 ]; then
+        log "HINWEIS: $N_POSEN Posendateien werden mitarchiviert. Das dauert"
+        log "         lange und erzeugt ein sehr grosses Archiv. Mit --no-poses"
+        log "         landen nur die CSVs im Tarball."
+    fi
+else
+    N_POSEN=0
+    log "RESULTS    : nur CSVs (--no-poses), Posen werden nicht gezaehlt"
 fi
 
 # Kompressor: pigz nutzt alle Kerne, gzip nur einen.
@@ -129,8 +149,15 @@ mkdir -p "$STAGE/$JOB"/{TARGET,slurm}
 
 log "── Sammle Metadaten ──"
 
-cp -a TARGET/config.txt "$STAGE/$JOB/TARGET/" 2>/dev/null \
-    || log "WARNUNG: TARGET/config.txt fehlt."
+if [ -f TARGET/config.txt ]; then
+    # Fehler NICHT nach /dev/null: in Job 77159 meldete das Skript
+    # "config.txt fehlt", obwohl die Datei da war – gescheitert war das
+    # cp aus einem anderen Grund, und die Ursache blieb unsichtbar.
+    cp -a TARGET/config.txt "$STAGE/$JOB/TARGET/" \
+        || die "TARGET/config.txt nicht kopierbar."
+else
+    log "WARNUNG: TARGET/config.txt fehlt."
+fi
 for t in "${TARGETS[@]}"; do
     if [ -f "TARGET/${t}.pdbqt" ]; then
         cp -a "TARGET/${t}.pdbqt" "$STAGE/$JOB/TARGET/"
@@ -146,10 +173,26 @@ for f in logs/*"${JOBID}"*.out logs/*"${JOBID}"*.err; do
 done
 log "Slurm-Logs : $found_logs Datei(en)"
 
-# Worker-Logs aus data/LOG
+# Worker-Logs: NICHT kopieren, sondern spaeter direkt in den Tarball
+# schreiben. Bei 8030 Dateien war der Kopiervorgang unnoetige Arbeit.
+#
+# Stufe 1 (Konvertierung) hinterlaesst pro fehlgeschlagenem Molekuel eine
+# *_convert_error.log. Die gehoeren nicht zu diesem Lauf und machten in
+# Job 77159 den Grossteil der 8030 Dateien aus. --all-logs behaelt sie.
+LOG_EXCLUDE=()
 if [ -d data/LOG ]; then
-    cp -a data/LOG "$STAGE/$JOB/LOG"
-    log "Worker-Logs: $(find "$STAGE/$JOB/LOG" -type f | wc -l) Datei(en)"
+    n_all=$(find data/LOG -type f | wc -l)
+    n_conv=$(find data/LOG -type f \( -name '*_convert_error.log' \
+                                     -o -name 'conversion.log' \) | wc -l)
+    if [ "$ALL_LOGS" = true ]; then
+        log "Worker-Logs: $n_all Datei(en), inkl. $n_conv aus der Konvertierung"
+    else
+        # Zwei Muster: die Einzelfehler pro Molekuel und die Sammeldatei.
+        LOG_EXCLUDE=(--exclude=*_convert_error.log --exclude=conversion.log)
+        log "Worker-Logs: $(( n_all - n_conv )) Datei(en)"
+        [ "$n_conv" -gt 0 ] && \
+            log "             $n_conv Konvertierungs-Logs ausgelassen (--all-logs nimmt sie mit)"
+    fi
 else
     log "WARNUNG: data/LOG fehlt."
 fi
@@ -160,7 +203,7 @@ n_rank=0
 for t in "${TARGETS[@]}"; do
     src="RESULTS/$t/rescoring_ligands_${t}.csv"
     if [ ! -s "$src" ]; then
-        log "WARNUNG: $src fehlt – Rescoring fuer '$t' nicht abgeschlossen?"
+        log "Kein Ranking fuer '$t' – Rescoring noch nicht gelaufen."
         continue
     fi
     cp -a "$src" "$STAGE/$JOB/"
@@ -186,7 +229,12 @@ with open(dst, "w", newline="", encoding="utf-8") as fh:
 print(f"  Top{n}: {min(n, len(rows))} von {len(rows):,} Liganden")
 PY
 done
-[ "$n_rank" -gt 0 ] || log "WARNUNG: Kein einziges Ranking gefunden."
+if [ "$n_rank" -eq 0 ]; then
+    # Kein Fehler: ein reines Docking-Archiv ist ein gueltiges Ergebnis.
+    log "Kein Rescoring vorhanden – Archiv enthaelt nur Docking-Ergebnisse."
+else
+    log "Rankings   : $n_rank Target(s)"
+fi
 
 # ── Manifest ──────────────────────────────────────────────────────────
 {
@@ -197,6 +245,9 @@ done
     echo "Targets:     ${TARGETS[*]}"
     echo "Posen:       $N_POSEN"
     echo "Posen im Archiv: $WITH_POSES"
+    echo "Rankings:    $n_rank von ${#TARGETS[@]} Target(s)"
+    [ "$n_rank" -eq 0 ] && echo "Hinweis:     Rescoring war zum Zeitpunkt der Archivierung nicht gelaufen."
+    echo "Konvertierungs-Logs: $ALL_LOGS"
     echo
     echo "── Konfiguration ──"
     for ini in config/*.ini; do
@@ -226,10 +277,18 @@ else
     RESULTS_ARGS=(-C "$PROJECT" -T "$STAGE/results_files.txt")
 fi
 
+LOG_ARGS=()
+[ -d data/LOG ] && LOG_ARGS=(-C "$PROJECT/data" LOG)
+
+# --transform wirkt auf jeden Eintrag; die Staging-Eintraege beginnen mit
+# "$JOB/" und werden von beiden Ausdruecken nicht getroffen.
 tar --use-compress-program="$COMPRESS" \
     --transform "s|^RESULTS|$JOB/RESULTS|" \
+    --transform "s|^LOG|$JOB/LOG|" \
+    "${LOG_EXCLUDE[@]}" \
     -cf "$ARCHIVE" \
     -C "$STAGE" "$JOB" \
+    "${LOG_ARGS[@]}" \
     "${RESULTS_ARGS[@]}" \
     || die "tar fehlgeschlagen."
 
