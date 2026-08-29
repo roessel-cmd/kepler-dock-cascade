@@ -7,19 +7,11 @@ im Container – vor dem Start der Pipeline.
 
     python3 check_config.py config/
 
-Der Preis der Modularisierung ist, dass [PATHS] in mehreren Dateien
-steht. Die Uebergabepunkte zwischen den Stufen muessen aber exakt
+Die Uebergabepunkte zwischen den Stufen muessen aber exakt
 uebereinstimmen:
 
     docking.ini  results_dir  ==  rescore.ini  results_dir
     docking.ini  target_dir   ==  rescore.ini  target_dir
-
-Stufe 1 (sdf_to_pdbqt.sif) hat keine INI – sie wird per CLI
-parametrisiert. Ihr --out-dir muss dem pdbqt_dir aus docking.ini
-entsprechen; das prueft check_ligands.py.
-
-Genau das prueft dieses Skript – plus ein paar Plausibilitaeten, die
-sonst erst nach Stunden Laufzeit auffallen.
 """
 
 from __future__ import annotations
