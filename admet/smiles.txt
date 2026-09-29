@@ -1,0 +1,24 @@
+#POCKET_1
+#rank, Smiles
+
+1, CC(=O)Oc1ccccc1C(=O)O
+2, CC(C)Cc1ccc(cc1)C(C)C(=O)O
+3, CC(=O)Nc1ccc(O)cc1
+4, COc1ccc2cc(ccc2c1)C(C)C(=O)O
+5, CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O
+
+#POCKET_2
+#rank, Smiles
+
+1, Cn1cnc2c1c(=O)n(C)c(=O)n2C
+2, CN1c2ccc(Cl)cc2C(=NCC1=O)c1ccccc1
+3, OC(Cn1cncn1)(Cn1cncn1)c1ccc(F)cc1F
+4, OC(=O)c1cn(C2CC2)c2cc(N3CCNCC3)c(F)cc2c1=O
+
+#POCKET_3
+#rank, Smiles, Score
+
+1, CCCCc1nc(Cl)c(CO)n1Cc1ccc(-c2ccccc2-c2nnn[nH]2)cc1
+2, CCCc1nn(C)c2c1nc([nH]c2=O)-c1cc(ccc1OCC)S(=O)(=O)N1CCN(C)CC1
+3, Cc1ccc(NC(=O)c2ccc(CN3CCN(C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1
+4, CN(C)C(=N)NC(=N)N
